@@ -3,15 +3,45 @@
 Julia/Lux implementation of a chess language model that replaces the Mamba
 backbone with Wave-PDE blocks inspired by the Wave-PDE Nets paper.
 
-Paper reference in this repo:
+Paper reference in the local workspace:
 
 - `2510.04304v1.pdf`
 
 ## Contents
 
-- `src/WavePDEChess.jl`: model, DuckDB-backed parquet loader, and training loop
+- `src/WavePDEChess.jl`: top-level module facade and compatibility layer
+- `src/Core/`: reusable `WavePDECore` backbone
+- `src/Adapters/`: chess-specific input adapter
+- `src/Heads/`: proposer/checker head interfaces and chess heads
+- `src/Models/`: proposer-only and multi-head chess model composition
+- `src/Training/`: DuckDB-backed parquet loader and training loop
 - `scripts/train_chess_wavepde.jl`: entrypoint for training
 - `test/runtests.jl`: smoke tests for the model and a one-step training run
+
+## Current Modular Layout
+
+Near-term chess model:
+
+```text
+[Chess tokens]
+      |
+      v
++------------------+
+| ChessInputAdapter|
++------------------+
+      |
+      v
++------------------+
+| WavePDECore      |
++------------------+
+      |
+      +----------------------+
+      |                      |
+      v                      v
++------------------+   +------------------+
+| ChessMoveHead    |   | ChessCheckerHead |
++------------------+   +------------------+
+```
 
 ## Relation To The Paper
 
