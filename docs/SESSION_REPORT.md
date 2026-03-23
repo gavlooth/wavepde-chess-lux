@@ -273,6 +273,8 @@
       - removed the fixed-sequence-length blocker inside `DispersiveBlock`: the Airy operator now reuses the cached spectral grid at the configured length and regenerates the grid on the fly for shorter or otherwise different runtime sequence lengths
       - added a top-level `AiryPDEConfig`, `ChessModelConfig(::AiryPDEConfig)`, `ChessModel(::AiryPDEConfig)`, and `chess_airy_11m_config()` preset so the Airy core can be selected without manual `ChessModelConfig` assembly
       - added `scripts/train_chess_airy_lm.jl` and `scripts/train_chess_airy.jl` as proposer-only Airy-core training entrypoints mirroring the existing transcript-language WavePDE scripts
+      - generalized `scripts/train_chess_state_transition.jl` with `WAVEPDE_CORE_KIND=:wavepde|:airy` so the existing state-transition training surface can instantiate either the WavePDE core or the Airy core without duplicating the main trainer logic
+      - added `scripts/train_chess_state_transition_airy.jl` as the dedicated Airy state-transition wrapper
       - added direct regression coverage in `test/runtests.jl` for scaled frequencies, Airy stability control, and gradient flow through the clamped branch
     - experiment commands and key metrics:
       - `julia --project=. -e 'include("src/DisparsivePDE.jl"); ...; println((size(y), length(result.losses), result.losses[1], st_next == st))'`
@@ -289,10 +291,12 @@
       - result: full project test suite passed again after the generic-core integration, with `DispersivePDE Module | 21/21`; the new regression verified that `ChessModel` can run with `DispersionConfig` as its `core` on a shorter runtime sequence than the configured maximum
       - `julia --project=. -e 'module AiryEntryPointSmoke; include("scripts/train_chess_airy_lm.jl"); @assert isdefined(@__MODULE__, :run_chess_airy_lm_training); println("airy_entrypoint_ok"); end'`
       - result: standalone Airy training entrypoint loaded successfully with `airy_entrypoint_ok`
+      - `julia --project=. -e 'module AiryStateTransitionSmoke; include("scripts/train_chess_state_transition_airy.jl"); @assert isdefined(@__MODULE__, :run_chess_state_transition_airy_training); @assert isdefined(@__MODULE__, :run_chess_state_transition_training); println("airy_state_transition_entrypoint_ok"); end'`
+      - result: standalone Airy state-transition entrypoint loaded successfully with `airy_state_transition_entrypoint_ok`
       - `julia --project=. test/runtests.jl`
-      - result: full project test suite passed again after adding `AiryPDEConfig`, `chess_airy_11m_config()`, and the Airy training entrypoints, with `DispersivePDE Module | 21/21`
+      - result: full project test suite passed again after adding `AiryPDEConfig`, `chess_airy_11m_config()`, the Airy training entrypoints, and `WAVEPDE_CORE_KIND` support for state-transition training, with `DispersivePDE Module | 21/21`
     - best current checkpoint/config recommendation:
-      - `src/DisparsivePDE.jl` is now usable through `WavePDEChess`, through the existing model-config surface as an alternative `core`, and through dedicated Airy training entrypoints; keep it as an Airy-style PDE submodule unless there is a reason to flatten it into the top-level architecture/config path
+      - `src/DisparsivePDE.jl` is now usable through `WavePDEChess`, through the existing model-config surface as an alternative `core`, and through dedicated Airy training entrypoints for both proposer-only LM and state-transition training; keep it as an Airy-style PDE submodule unless there is a reason to flatten it into the top-level architecture/config path
     - unresolved issue / next action:
       - if this module is meant to become production code, the next step is deciding whether it should be integrated into the package exports and model configuration surface rather than remaining an include-only standalone module
       - if it stays on the PDE path, the next serious upgrade is deciding between exact semigroup stepping versus multi-substep operator splitting so the block contract is as explicit as the main WavePDE solver contract
