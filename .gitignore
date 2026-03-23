@@ -1,0 +1,14 @@
+Manifest.toml.old
+*.log
+*.tmp
+
+# local checkpoints and generated outputs
+checkpoints/
+
+# local papers / downloads / scratch files
+*.pdf
+2510.04304
+1.pdf
+
+# downloaded upstream source repo and datasets
+chess-mamba-vs-xformer/
