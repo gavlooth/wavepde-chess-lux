@@ -1,5 +1,26 @@
 module WavePDEChess
 
+"""
+WavePDEChess
+
+Chess language model built around Wave-PDE residual blocks.
+
+Paper reference:
+    `2510.04304v1.pdf` in the repository root (`Wave-PDE Nets`).
+
+Paper-faithful parts in this implementation:
+- wave speed `c(x)` and damping `γ(x)` are produced from learned 1x1 projections
+  and constrained with `softplus`
+- the Laplacian is applied spectrally with FFTs
+- the solver uses a symplectic velocity-Verlet style update with split damping
+
+Intentional divergences from the paper:
+- the "spatial" domain is the token axis, so the PDE mixes sequence positions
+  rather than feature channels
+- `dt` is a learned scalar per layer instead of a fixed hyperparameter
+- Wave-PDE is the main backbone, not one branch inside a larger hybrid block
+"""
+
 using DBInterface
 using DuckDB
 using FFTW
@@ -66,6 +87,23 @@ function spectral_laplacian(u::AbstractArray{T, 3}) where {T<:AbstractFloat}
     return T.(real.(FFTW.ifft(lap_hat, 2)))
 end
 
+function split_damped_leapfrog_step(
+    u::AbstractArray{T, 3},
+    v::AbstractArray{T, 3},
+    c_sq::AbstractArray{T, 3},
+    damping_split::AbstractArray{T, 3},
+    dt::T,
+) where {T<:AbstractFloat}
+    # The paper emphasizes a symplectic velocity-Verlet update; we keep that
+    # structure but use the chess model's sequence-axis spectral operator.
+    v_a = damping_split .* v
+    v_b = v_a .+ (dt / 2) .* (c_sq .* spectral_laplacian(u))
+    u_next = u .+ dt .* v_b
+    v_c = v_b .+ (dt / 2) .* (c_sq .* spectral_laplacian(u_next))
+    v_next = damping_split .* v_c
+    return u_next, v_next
+end
+
 struct TokenEmbedding <: Lux.AbstractLuxLayer
     vocab_size::Int
     d_model::Int
@@ -110,7 +148,23 @@ struct WavePDESpectralMixer{T} <: Lux.AbstractLuxLayer
     dt_floor::T
 end
 
+function validate_wavepde_input(layer::WavePDESpectralMixer, x::AbstractArray)
+    ndims(x) == 3 || throw(ArgumentError(
+        "WavePDESpectralMixer expects a 3D tensor (d_model, seq_len, batch), got shape $(size(x)).",
+    ))
+    size(x, 1) == layer.d_model || throw(ArgumentError(
+        "WavePDESpectralMixer expected feature dimension $(layer.d_model), got $(size(x, 1)).",
+    ))
+    size(x, 2) > 0 || throw(ArgumentError("WavePDESpectralMixer requires seq_len > 0."))
+    size(x, 3) > 0 || throw(ArgumentError("WavePDESpectralMixer requires batch size > 0."))
+    return nothing
+end
+
 function Lux.initialparameters(rng::AbstractRNG, layer::WavePDESpectralMixer)
+    layer.d_model > 0 || throw(ArgumentError("d_model must be positive"))
+    layer.solver_steps > 0 || throw(ArgumentError("solver_steps must be positive"))
+    layer.dt_init > 0 || throw(ArgumentError("dt_init must be positive"))
+    layer.dt_floor >= 0 || throw(ArgumentError("dt_floor must be non-negative"))
     return (
         c_weight=glorot_uniform(rng, layer.d_model, layer.d_model),
         c_bias=zeros(Float32, layer.d_model),
@@ -123,6 +177,10 @@ end
 Lux.initialstates(::AbstractRNG, ::WavePDESpectralMixer) = NamedTuple()
 
 function (layer::WavePDESpectralMixer)(x::AbstractArray{T, 3}, ps, st) where {T<:AbstractFloat}
+    validate_wavepde_input(layer, x)
+
+    # Paper-faithful parameterization: c(x), γ(x) from 1x1 projections + softplus.
+    # Chess-specific divergence: the PDE runs over sequence positions, not channels.
     c = softplus_scalar.(linear1x1(x, ps.c_weight, ps.c_bias)) .+ layer.dt_floor
     gamma = softplus_scalar.(linear1x1(x, ps.gamma_weight, ps.gamma_bias))
     dt = softplus_scalar(ps.log_dt) + layer.dt_floor
@@ -130,13 +188,15 @@ function (layer::WavePDESpectralMixer)(x::AbstractArray{T, 3}, ps, st) where {T<
     u = x
     v = zero(x)
     c_sq = c .* c
+    damping_split = exp.(-gamma .* (dt / 2))
+
+    # This mirrors the paper's stability intent, but is only a heuristic guard
+    # here because c and dt are both learned and c varies per token.
+    max_wave_cfl = dt * maximum(c)
+    max_wave_cfl < one(T) || @warn "WavePDESpectralMixer stability heuristic exceeded: dt * max(c) = $max_wave_cfl >= 1"
 
     for _ in 1:layer.solver_steps
-        accel = c_sq .* spectral_laplacian(u) .- gamma .* v
-        v_half = v .+ (dt / 2) .* accel
-        u = u .+ dt .* v_half
-        accel_next = c_sq .* spectral_laplacian(u) .- gamma .* v_half
-        v = v_half .+ (dt / 2) .* accel_next
+        u, v = split_damped_leapfrog_step(u, v, c_sq, damping_split, dt)
     end
 
     return u, st
@@ -148,6 +208,10 @@ struct WavePDEBlock{N, M} <: Lux.AbstractLuxLayer
 end
 
 function WavePDEBlock(d_model::Int, solver_steps::Int, dt_init::Float32, norm_eps::Float32)
+    d_model > 0 || throw(ArgumentError("d_model must be positive"))
+    solver_steps > 0 || throw(ArgumentError("solver_steps must be positive"))
+    dt_init > 0 || throw(ArgumentError("dt_init must be positive"))
+    norm_eps > 0 || throw(ArgumentError("norm_eps must be positive"))
     norm = RMSNormLayer(d_model, norm_eps)
     mixer = WavePDESpectralMixer(d_model, solver_steps, dt_init, 1f-4)
     return WavePDEBlock(norm, mixer)
@@ -177,6 +241,13 @@ struct WavePDEChessLM{E, B, N} <: Lux.AbstractLuxLayer
 end
 
 function WavePDEChessLM(config::WavePDEConfig)
+    config.vocab_size > 0 || throw(ArgumentError("vocab_size must be positive"))
+    config.d_model > 0 || throw(ArgumentError("d_model must be positive"))
+    config.n_layer >= 0 || throw(ArgumentError("n_layer must be non-negative"))
+    config.max_seq_len > 0 || throw(ArgumentError("max_seq_len must be positive"))
+    config.solver_steps > 0 || throw(ArgumentError("solver_steps must be positive"))
+    config.dt_init > 0 || throw(ArgumentError("dt_init must be positive"))
+    config.norm_eps > 0 || throw(ArgumentError("norm_eps must be positive"))
     embedding = TokenEmbedding(config.vocab_size, config.d_model)
     blocks = ntuple(_ -> WavePDEBlock(config.d_model, config.solver_steps, config.dt_init, config.norm_eps), config.n_layer)
     norm = RMSNormLayer(config.d_model, config.norm_eps)
