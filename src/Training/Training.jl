@@ -17,6 +17,7 @@ Base.@kwdef struct TrainingConfig
     training_policy::Symbol = :full
     board_target_mode::Symbol = :none
     policy_condition_mode::Symbol = :state_only
+    state_target_mode::Symbol = :full
     checkpoint_path::String = joinpath(pwd(), "checkpoints", "wavepde_chess_checkpoint.jls")
     seed::Int = 1337
 end
@@ -54,6 +55,7 @@ const CHECKER_COLUMN_CANDIDATES = (
 const TRAINING_POLICIES = (:full, :adapters_only, :heads_only)
 const BOARD_TARGET_MODES = (:none, :transcript_board_facts)
 const POLICY_CONDITION_MODES = (:state_only, :state_action)
+const STATE_TARGET_MODES = (:full, :coarse_only)
 const TRANSCRIPT_COLUMN_CANDIDATES = ("transcript",)
 const MOVE_COLUMN_CANDIDATES = ("move_san",)
 
@@ -151,6 +153,21 @@ function validate_policy_condition_mode(mode::Symbol)
         "Unsupported policy_condition_mode $(mode). Supported modes are $(POLICY_CONDITION_MODES).",
     ))
     return mode
+end
+
+function validate_state_target_mode(mode::Symbol)
+    mode in STATE_TARGET_MODES || throw(ArgumentError(
+        "Unsupported state_target_mode $(mode). Supported modes are $(STATE_TARGET_MODES).",
+    ))
+    return mode
+end
+
+function state_target_length(next_state_tokens::AbstractVector{<:Integer}, mode::Symbol)
+    mode = validate_state_target_mode(mode)
+    if mode == :coarse_only
+        return min(length(next_state_tokens), BOARD_STATE_COARSE_LENGTH)
+    end
+    return length(next_state_tokens)
 end
 
 function load_transcript_board_examples(conn, path::AbstractString, transcript_column::AbstractString; min_tokens::Int=8)
@@ -493,8 +510,10 @@ function sample_training_batch(
     max_seq_len::Int,
     transition_candidates_per_example::Int=0,
     policy_condition_mode::Symbol=:state_only,
+    state_target_mode::Symbol=:full,
 )
     policy_condition_mode = validate_policy_condition_mode(policy_condition_mode)
+    state_target_mode = validate_state_target_mode(state_target_mode)
     sampled_states = Vector{Vector{Int32}}(undef, batch_size)
     sampled_next_states = Vector{Vector{Int32}}(undef, batch_size)
     sampled_moves = policy_condition_mode == :state_action ? Vector{String}(undef, batch_size) : String[]
@@ -532,14 +551,15 @@ function sample_training_batch(
         if policy_condition_mode == :state_action
             conditioned_tokens = append_policy_action_tokens(sampled_states[i], sampled_moves[i])
             tokens[1:length(conditioned_tokens), i] .= conditioned_tokens
-            target_length = length(sampled_next_states[i])
-            target_tokens[1:target_length, i] .= sampled_next_states[i]
+            target_length = state_target_length(sampled_next_states[i], state_target_mode)
+            target_tokens[1:target_length, i] .= sampled_next_states[i][1:target_length]
             target_mask[1:target_length, i] .= true
         else
             token_count = min(length(sampled_states[i]), max_batch_len)
             tokens[1:token_count, i] .= sampled_states[i][1:token_count]
-            target_tokens[1:token_count, i] .= sampled_next_states[i][1:token_count]
-            target_mask[1:token_count, i] .= true
+            target_length = min(state_target_length(sampled_next_states[i], state_target_mode), max_batch_len)
+            target_tokens[1:target_length, i] .= sampled_next_states[i][1:target_length]
+            target_mask[1:target_length, i] .= true
         end
     end
 
@@ -794,10 +814,48 @@ function save_checkpoint(path::AbstractString, payload)
     return path
 end
 
+function sample_training_batch_for_config(
+    corpus::ChessParquetCorpus,
+    rng::AbstractRNG,
+    cfg::TrainingConfig,
+    max_seq_len::Int,
+    policy_condition_mode::Symbol,
+    state_target_mode::Symbol,
+)
+    return sample_training_batch(
+        corpus,
+        rng;
+        batch_size=cfg.batch_size,
+        max_seq_len=max_seq_len,
+        transition_candidates_per_example=cfg.transition_candidates_per_example,
+        policy_condition_mode=policy_condition_mode,
+    )
+end
+
+function sample_training_batch_for_config(
+    corpus::StateTransitionParquetCorpus,
+    rng::AbstractRNG,
+    cfg::TrainingConfig,
+    max_seq_len::Int,
+    policy_condition_mode::Symbol,
+    state_target_mode::Symbol,
+)
+    return sample_training_batch(
+        corpus,
+        rng;
+        batch_size=cfg.batch_size,
+        max_seq_len=max_seq_len,
+        transition_candidates_per_example=cfg.transition_candidates_per_example,
+        policy_condition_mode=policy_condition_mode,
+        state_target_mode=state_target_mode,
+    )
+end
+
 function train!(model, corpus, cfg::TrainingConfig)
     rng = MersenneTwister(cfg.seed)
     training_policy = validate_training_policy(cfg.training_policy)
     policy_condition_mode = validate_policy_condition_mode(cfg.policy_condition_mode)
+    state_target_mode = validate_state_target_mode(cfg.state_target_mode)
     ps, st = Lux.setup(rng, model)
     optimizer = Optimisers.Adam(cfg.learning_rate)
     opt_state = Optimisers.setup(optimizer, ps)
@@ -805,13 +863,13 @@ function train!(model, corpus, cfg::TrainingConfig)
 
     for step in 1:cfg.max_iters
         maybe_rotate_file!(corpus, rng, step; every=cfg.train_file_update_interval)
-        batch = sample_training_batch(
+        batch = sample_training_batch_for_config(
             corpus,
-            rng;
-            batch_size=cfg.batch_size,
-            max_seq_len=model.config.max_seq_len,
-            transition_candidates_per_example=cfg.transition_candidates_per_example,
-            policy_condition_mode=policy_condition_mode,
+            rng,
+            cfg,
+            model.config.max_seq_len,
+            policy_condition_mode,
+            state_target_mode,
         )
 
         loss = autoregressive_loss(

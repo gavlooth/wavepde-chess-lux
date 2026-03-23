@@ -1,6 +1,6 @@
 Base.@kwdef struct ChessMultiHeadModelConfig
     adapter::ChessAdapterConfig = ChessAdapterConfig()
-    core::WavePDECoreConfig = WavePDECoreConfig()
+    core::SequenceCoreConfig = WavePDECoreConfig()
     proposer::ChessMoveHeadConfig = ChessMoveHeadConfig()
     checker::ChessCheckerHeadConfig = ChessCheckerHeadConfig()
     max_seq_len::Int = 1536
@@ -16,9 +16,9 @@ end
 
 function validate_chess_multihead_config(config::ChessMultiHeadModelConfig)
     config.max_seq_len > 0 || throw(ArgumentError("max_seq_len must be positive"))
-    config.adapter.d_model == config.core.d_model || throw(ArgumentError("adapter d_model must match core d_model"))
-    config.proposer.d_model == config.core.d_model || throw(ArgumentError("proposer d_model must match core d_model"))
-    config.checker.d_model == config.core.d_model || throw(ArgumentError("checker d_model must match core d_model"))
+    config.adapter.d_model == core_d_model(config.core) || throw(ArgumentError("adapter d_model must match core d_model"))
+    config.proposer.d_model == core_d_model(config.core) || throw(ArgumentError("proposer d_model must match core d_model"))
+    config.checker.d_model == core_d_model(config.core) || throw(ArgumentError("checker d_model must match core d_model"))
     config.proposer.vocab_size == config.adapter.vocab_size || throw(ArgumentError("proposer vocab_size must match adapter vocab_size"))
     return nothing
 end
@@ -28,7 +28,7 @@ function ChessMultiHeadModel(config::ChessMultiHeadModelConfig)
     return ChessMultiHeadModel(
         config,
         ChessInputAdapter(config.adapter),
-        WavePDECore(config.core),
+        build_sequence_core(config.core),
         ChessMoveHead(config.proposer),
         ChessCheckerHead(config.checker),
     )

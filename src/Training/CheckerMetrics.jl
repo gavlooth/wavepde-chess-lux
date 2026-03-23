@@ -243,9 +243,22 @@ function state_slot_family_metrics(predictions::AbstractMatrix{<:Integer}, targe
     size(predictions) == size(targets) || throw(ArgumentError(
         "state_slot_family_metrics expects predictions and targets with the same shape, got $(size(predictions)) and $(size(targets)).",
     ))
-    size(predictions, 1) >= 210 || throw(ArgumentError(
-        "state_slot_family_metrics expects at least 210 state slots, got $(size(predictions, 1)).",
+    size(predictions, 1) >= 72 || throw(ArgumentError(
+        "state_slot_family_metrics expects at least 72 state slots, got $(size(predictions, 1)).",
     ))
+    nan_metrics = (
+        token_accuracy=NaN,
+        exact_match_rate=NaN,
+        num_tokens=0,
+        num_examples=size(predictions, 2),
+    )
+    if size(predictions, 1) < 210
+        return (
+            coarse_state=slot_family_metrics(predictions, targets, 1:72),
+            attack_maps=nan_metrics,
+            pressure_counts=nan_metrics,
+        )
+    end
     return (
         coarse_state=slot_family_metrics(predictions, targets, 1:72),
         attack_maps=slot_family_metrics(predictions, targets, 73:200),

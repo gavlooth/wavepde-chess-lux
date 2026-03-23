@@ -33,6 +33,11 @@
   - hardened legality-aware evaluation so invalid decoded successor states are scored as invalid instead of crashing the run
   - added `scripts/train_chess_reasoning.jl` as the reasoning-oriented entrypoint over board-fact supervision
   - added `scripts/build_chess_pgn_parquet.jl`, `scripts/build_chess_state_from_transcript_parquet.jl`, `scripts/train_chess_state_transition.jl`, and `scripts/eval_chess_state_transition.jl` for the first state-first training and evaluation path
+  - added explicit scaled state-transition launchers `scripts/train_chess_state_transition_15m.jl` and `scripts/train_chess_state_transition_50m.jl` so the state-first regime can be exercised at reproducible `14.86M` and `50.31M` parameter targets without ad hoc environment sizing
+  - fixed the 50M training crash in `src/Core/WavePDECore.jl` by moving the CFL stability warning path outside Zygote differentiation, and added a regression test covering the unstable-`dt` branch under gradient in `test/runtests.jl`
+  - replaced passive CFL warnings with enforced CFL control in `src/Core/WavePDECore.jl`: the effective timestep is now clamped batchwise so `dt_eff * max(c)` stays below a configurable safety factor, with the raw overshoot still logged outside the differentiated path
+  - threaded `cfl_safety_factor` / `cfl_eps` through `WavePDECoreConfig`, `WavePDEConfig`, and `scripts/train_chess_state_transition.jl`
+  - added `scripts/train_chess_state_policy_50m.jl` as the dedicated high-capacity `state_action` launcher with a stricter default `WAVEPDE_CFL_SAFETY_FACTOR=0.9`
   - added synthetic symbolic bridge-task generation plus `scripts/train_symbolic_bridge.jl`
   - added a transfer-comparison harness plus `scripts/run_symbolic_transfer_comparison.jl` for scratch vs transplanted-core symbolic runs
   - replaced the old completed modular backlog with a new state-first PGN architecture backlog and updated the next-steps plan accordingly
@@ -128,18 +133,167 @@
       - `checkpoint_05`: train `1.3476123`, val `1.1623056`
       - `checkpoint_06`: train `0.9558252`, staged val `0.74563473`
     - full held-out evaluation for `checkpoint_06`: `5208` validation games, token-weighted val loss `0.7411626222129974`, approximate perplexity `2.0983737127576156`
+  - scaled state-first smoke gate:
+    - exact parameter targets on the live tree:
+      - `scripts/train_chess_state_transition_15m.jl`: `d_model=608`, `n_layer=20`, `solver_steps=4`, `14,858,932` parameters
+      - `scripts/train_chess_state_transition_50m.jl`: `d_model=1120`, `n_layer=20`, `solver_steps=4`, `50,309,300` parameters
+    - 15M smoke train command: `CHESS_DATA_DIR=tmp/state_first_runtime/state_train WAVEPDE_CHECKPOINT=tmp/state_first_runtime/checkpoints/state_transition_15m_smoke.jls WAVEPDE_MAX_ITERS=20 WAVEPDE_BATCH_SIZE=8 WAVEPDE_LOG_INTERVAL=5 julia --project=. scripts/train_chess_state_transition_15m.jl`
+    - 15M smoke training logs:
+      - `step=1 loss=1.7035`
+      - `step=5 loss=1.5445`
+      - `step=10 loss=1.0077`
+      - `step=15 loss=0.926`
+      - `step=20 loss=0.7117462`
+    - 15M smoke eval command: `CHESS_EVAL_DIR=tmp/state_first_runtime/state_eval_small WAVEPDE_CHECKPOINT=tmp/state_first_runtime/checkpoints/state_transition_15m_smoke.jls WAVEPDE_BATCH_SIZE=8 julia --project=. scripts/eval_chess_state_transition.jl`
+    - 15M smoke held-out metrics on `tmp/state_first_runtime/state_eval_small`:
+      - `num_examples=338`
+      - `num_tokens=70980`
+      - `token_loss=0.780054998115675`
+      - `approx_perplexity=2.181592245661512`
+      - `exact_slot_accuracy=0.9462102000563539`
+      - `board_fact_overall_accuracy=0.8777120315581854`
+      - `state_slot_coarse_token_accuracy=0.9427186061801447`
+      - `state_slot_attack_token_accuracy=0.9532636834319527`
+      - `state_slot_pressure_token_accuracy=0.8810650887573964`
+      - `successor_valid_board_rate=1.0`
+      - `successor_reachable_rate=0.0`
+      - `successor_reachable_strict_rate=0.0`
+  - 50M crash debug and restart validation:
+    - failure reproduction: `julia --project=. -e 'include("src/WavePDEChess.jl"); using .WavePDEChess, Random, Lux, Zygote; ... ps_bad=(; ps..., log_dt=10.0f0); Zygote.gradient(...)'`
+    - reproduced error before patch: `` `llvmcall` requires the compiler `` when the CFL warning branch executed inside `WavePDESpectralMixer`
+    - post-fix repro result: warning still emitted, gradient completed successfully with `bad_ok 545`
+    - verification: `julia --project=. test/runtests.jl` passed on the patched tree
+    - 50M retry command: `CHESS_DATA_DIR=tmp/state_first_runtime/state_train WAVEPDE_CHECKPOINT=tmp/state_first_runtime/checkpoints/state_transition_50m_retry.jls WAVEPDE_MAX_ITERS=80 WAVEPDE_BATCH_SIZE=4 WAVEPDE_LOG_INTERVAL=5 julia --project=. scripts/train_chess_state_transition_50m.jl`
+    - completed retry result on the patched tree:
+      - progressed past the original crash point and finished all `80` steps without repeating the compiler failure
+      - final late-stage losses: `step=70 loss=0.3638`, `step=75 loss=0.2252`, `step=80 loss=0.255429`
+      - saved checkpoint: `/home/christos/code/julia/wavepde-chess-lux/tmp/state_first_runtime/checkpoints/state_transition_50m_retry.jls`
+      - log: `/home/christos/code/julia/wavepde-chess-lux/tmp/state_first_runtime/checkpoints/state_transition_50m_retry.log`
+  - 50M checkpoint evaluation:
+    - small held-out eval command: `CHESS_EVAL_DIR=tmp/state_first_runtime/state_eval_small WAVEPDE_CHECKPOINT=tmp/state_first_runtime/checkpoints/state_transition_50m_retry.jls WAVEPDE_BATCH_SIZE=8 julia --project=. scripts/eval_chess_state_transition.jl`
+    - small held-out eval metrics:
+      - `num_examples=338`
+      - `num_tokens=70980`
+      - `token_loss=0.2816077399359652`
+      - `approx_perplexity=1.3252587719252908`
+      - `exact_slot_accuracy=0.9500704423781346`
+      - `board_fact_overall_accuracy=0.9556213017751479`
+      - `board_fact_exact_match_rate=0.7130177514792899`
+      - `successor_valid_board_rate=0.8668639053254438`
+      - `successor_reachable_rate=0.0`
+      - `successor_reachable_strict_rate=0.0`
+    - interpretation:
+      - scaling from the `15M` smoke checkpoint to `50M` sharply improved token loss and board-fact quality on the small eval split
+      - decoded-board validity regressed from `1.0` on the `15M` smoke checkpoint to `0.8669` here
+      - reachability remained `0.0`, so bigger state-only capacity did not solve transition faithfulness
+    - full held-out eval on `tmp/state_first_runtime/state_eval` was still running at report time
+  - best-stability-control patch verification and new regime launch:
+    - verification:
+      - `julia --project=. test/runtests.jl`
+      - `julia --project=. -e 'include("scripts/train_chess_state_transition_15m.jl"); include("scripts/train_chess_state_transition_50m.jl"); include("scripts/train_chess_state_policy_50m.jl"); println("scaled_state_scripts_ok")'`
+      - full test suite passed on the enforced-CFL tree
+    - first `50M state_action` launch:
+      - train command: `CHESS_DATA_DIR=tmp/state_first_runtime/state_train WAVEPDE_CHECKPOINT=tmp/state_first_runtime/checkpoints/state_action_50m_cfl_run.jls WAVEPDE_MAX_ITERS=80 WAVEPDE_BATCH_SIZE=4 WAVEPDE_LOG_INTERVAL=5 julia --project=. scripts/train_chess_state_policy_50m.jl`
+      - launch log: `/home/christos/code/julia/wavepde-chess-lux/tmp/state_first_runtime/checkpoints/state_action_50m_cfl_run.log`
+      - checkpoint target: `/home/christos/code/julia/wavepde-chess-lux/tmp/state_first_runtime/checkpoints/state_action_50m_cfl_run.jls`
+      - initial live status: `step=1 loss=2.4365 seq_len=216 file=pgn_state_transitions.parquet`
+  - coarse-target successor training change:
+    - code/config changes made:
+      - introduced `state_target_mode` in `TrainingConfig` with `:full` and `:coarse_only`
+      - state-transition batch sampling and evaluation now support supervising only the coarse `72`-token board-state prefix while keeping the richer derived features on the input side
+      - `scripts/train_chess_state_policy_50m.jl` now defaults to `state_target_mode=coarse_only`
+      - tightened test coverage for coarse-only masking, evaluation, and explicit `WavePDEChess.train!` qualification inside the mixed-module test file
+    - verification:
+      - `julia --project=. test/runtests.jl`
+      - `julia --project=. -e 'include("scripts/train_chess_state_policy_50m.jl"); include("scripts/eval_chess_state_transition.jl"); println("coarse_state_action_scripts_ok")'`
+      - both passed on the coarse-target tree
+    - active run after verification:
+      - train command: `CHESS_DATA_DIR=tmp/state_first_runtime/state_train WAVEPDE_CHECKPOINT=tmp/state_first_runtime/checkpoints/state_action_50m_cfl_coarse_run_20260323_162354.jls WAVEPDE_MAX_ITERS=80 WAVEPDE_BATCH_SIZE=4 WAVEPDE_LOG_INTERVAL=5 julia --project=. scripts/train_chess_state_policy_50m.jl`
+      - active log: `/home/christos/code/julia/wavepde-chess-lux/tmp/state_first_runtime/checkpoints/state_action_50m_cfl_coarse_run_20260323_162354.log`
+      - final train result:
+        - `step=80 loss=0.47619617`
+        - saved checkpoint: `/home/christos/code/julia/wavepde-chess-lux/tmp/state_first_runtime/checkpoints/state_action_50m_cfl_coarse_run_20260323_162354.jls`
+        - checkpoint size: `193M`
+      - operational note:
+        - an earlier duplicate coarse-target process from a polluted tmux pane was cancelled so the active run is now unambiguous
+    - small held-out coarse-target eval:
+      - command: `CHESS_EVAL_DIR=tmp/state_first_runtime/state_eval_small WAVEPDE_POLICY_CONDITION_MODE=state_action WAVEPDE_STATE_TARGET_MODE=coarse_only WAVEPDE_CHECKPOINT=tmp/state_first_runtime/checkpoints/state_action_50m_cfl_coarse_run_20260323_162354.jls WAVEPDE_BATCH_SIZE=8 julia --project=. scripts/eval_chess_state_transition.jl`
+      - metrics:
+        - `num_examples=338`
+        - `num_tokens=24336`
+        - `token_loss=0.34068934284371033`
+        - `approx_perplexity=1.4059164150186745`
+        - `exact_slot_accuracy=0.958456607495069`
+        - `exact_sequence_match_rate=0.0`
+        - `board_fact_overall_accuracy=0.9635108481262328`
+        - `board_fact_exact_match_rate=0.7544378698224852`
+        - `successor_valid_board_rate=0.8846153846153846`
+        - `successor_reachable_rate=0.0`
+        - `successor_reachable_strict_rate=0.0`
+      - interpretation:
+        - the coarse-only target improved token loss, coarse slot accuracy, board-fact accuracy, and valid-board rate versus the earlier full-target `50M state_action` checkpoint
+        - reachability still remained at `0.0`, so the coarse-target change improved state quality but did not yet solve transition faithfulness
+    - full held-out coarse-target eval:
+      - command: `CHESS_EVAL_DIR=tmp/state_first_runtime/state_eval WAVEPDE_POLICY_CONDITION_MODE=state_action WAVEPDE_STATE_TARGET_MODE=coarse_only WAVEPDE_CHECKPOINT=tmp/state_first_runtime/checkpoints/state_action_50m_cfl_coarse_run_20260323_162354.jls WAVEPDE_BATCH_SIZE=8 julia --project=. scripts/eval_chess_state_transition.jl`
+      - status at report time: still running in the background; redirected log path is `/home/christos/code/julia/wavepde-chess-lux/tmp/state_first_runtime/checkpoints/state_action_50m_cfl_coarse_eval_full_20260323_162354.log`
 - best current checkpoint/config recommendation
   - the current best abstraction-oriented code path is the new PGN-derived state-transition route through `scripts/train_chess_state_transition.jl`
   - for raw chess data, point `CHESS_PGN_SOURCE` at `.pgn` files and let the entrypoint derive parquet state transitions automatically
   - when raw PGN is not available but transcript parquet is, use `scripts/build_chess_state_from_transcript_parquet.jl` to derive the same state-transition training surface
   - use `scripts/train_chess_state_policy.jl` when testing move-conditioned successor training and `scripts/train_chess_dual_surface.jl` when transcript reconstruction is needed as an auxiliary surface
   - use `scripts/train_chess_wavepde.jl` only when the goal is staying on the existing transcript-token baseline
+  - for scaled runtime work, use `scripts/train_chess_state_transition_15m.jl` as the end-to-end smoke gate and `scripts/train_chess_state_transition_50m.jl` as the direct high-capacity launch target
+  - the current best active state-first checkpoint is `/home/christos/code/julia/wavepde-chess-lux/tmp/state_first_runtime/checkpoints/state_action_50m_cfl_coarse_run_20260323_162354.jls` with training logs in `/home/christos/code/julia/wavepde-chess-lux/tmp/state_first_runtime/checkpoints/state_action_50m_cfl_coarse_run_20260323_162354.log`
   - the best available abstraction-oriented checkpoint from this repo is `/home/christos/code/julia/wavepde-chess-lux/tmp/state_first_runtime/checkpoints/state_first_checkpoint.jls`
   - the earlier `/home/christos/code/julia/wavepde-chess-lux/checkpoints/cp6_run_20260323/checkpoint_06.jls` remains only a reduced-config transcript baseline reference
 - unresolved issues and next actions
   - scale the new state-first runtime beyond the current Hikaru sample and keep held-out successor-state evaluation in place
-  - `successor_reachable_rate` is still `0.0` even when decoded boards are valid, so the next real regime test is larger move-conditioned training and/or legality-constrained decoding
+  - the relaxed `successor_reachable_rate` metric is now fixed structurally, but the 15M smoke checkpoint still scores `0.0` on both relaxed and strict reachability after only `20` steps; this is now a model/training behavior issue rather than an eval bug
+  - the 50M retry still emits repeated CFL stability warnings after the crash fix, so the next optimization work should focus on `dt` / `c` stabilization rather than compiler-path debugging
+  - the `50M` checkpoint improved easy predictive metrics but still fails the transition-faithfulness gate (`reachable_rate=0.0`) and now also regresses `valid_board_rate`, so the next serious experiment should be state-action conditioning and/or explicit stability constraints before spending more budget on raw scale
+  - the coarse-target `50M state_action` checkpoint materially improved state quality on the small held-out split, but did not move reachability off zero
+  - let the full held-out coarse-target eval finish, then decide whether the next step should be legality-aware decoding / constrained successor heads rather than another target-surface tweak
   - the transcript-side transition-consistency path is now a compatibility-only shared-checker path; future transition expansion should happen on the state/policy path instead
   - the current solver uses the split-damping variant already present in the workspace and still needs an explicit paper-fidelity decision
   - the next concrete work items are recorded in `docs/plans/modular-refactor-next-steps.md`
+  - supplemental standalone-module repair:
+    - objective attempted: restore `src/DisparsivePDE.jl` to a parseable, runnable, differentiable state inside the current Lux-based project
+    - code changes made:
+      - replaced the broken one-line module with a self-contained Lux implementation of `DispersionConfig`, `DispersiveBlock`, `DispersiveStack`, `frequency_grid`, `make_identity_dataset`, and `train!`
+      - removed the undeclared `Flux` dependency from that module path, switched training to `Optimisers` + `Zygote`, and fixed AD blockers by avoiding in-place FFT mutation and widening the GELU helper for dual numbers
+      - upgraded the standalone module from a generic dispersive exponential to an Airy-style residual PDE block:
+        - `frequency_grid` now uses the same `2π / N` spectral scaling discipline as the main WavePDE core
+        - the symbol now uses signed `k^3` rather than `|k|^3`, so the block behaves like a damped Airy semigroup instead of an even fractional phase operator
+        - each block now has WavePDE-style pre-normalization plus a small initialized residual gate
+        - `DispersionConfig` now exposes `dt_floor`, `alpha_floor`, `phase_limit`, `decay_limit`, `residual_init_scale`, `stability_eps`, and `warn_on_clamp`
+        - effective timestep is now clamped by Airy-operator strength limits on both decay and phase, with warnings emitted outside the differentiated graph
+      - integrated the Airy block into `src/WavePDEChess.jl` so `WavePDEChess` now includes and re-exports `DispersivePDE`, `DispersionConfig`, `DispersiveBlock`, `DispersiveStack`, and `frequency_grid`
+      - rewired the regression in `test/runtests.jl` to validate the public `WavePDEChess` surface instead of including `src/DisparsivePDE.jl` directly
+      - generalized the model config path so `DispersionConfig` can now be used as the `core` in `ChessModelConfig`, `ChessMultiHeadModelConfig`, and `DualSurfaceStateModelConfig` through shared `SequenceCoreConfig`, `core_d_model`, and `build_sequence_core` helpers
+      - removed the fixed-sequence-length blocker inside `DispersiveBlock`: the Airy operator now reuses the cached spectral grid at the configured length and regenerates the grid on the fly for shorter or otherwise different runtime sequence lengths
+      - added a top-level `AiryPDEConfig`, `ChessModelConfig(::AiryPDEConfig)`, `ChessModel(::AiryPDEConfig)`, and `chess_airy_11m_config()` preset so the Airy core can be selected without manual `ChessModelConfig` assembly
+      - added `scripts/train_chess_airy_lm.jl` and `scripts/train_chess_airy.jl` as proposer-only Airy-core training entrypoints mirroring the existing transcript-language WavePDE scripts
+      - added direct regression coverage in `test/runtests.jl` for scaled frequencies, Airy stability control, and gradient flow through the clamped branch
+    - experiment commands and key metrics:
+      - `julia --project=. -e 'include("src/DisparsivePDE.jl"); ...; println((size(y), length(result.losses), result.losses[1], st_next == st))'`
+      - result: forward pass returned `(4, 8, 3)`, one-epoch toy training completed with loss `3.0092402`, state remained unchanged
+      - `julia --project=. -e 'using Test, Random, Lux; include("src/DisparsivePDE.jl"); ...; println("dispersive ok")'`
+      - result: targeted regression checks passed with `dispersive ok`
+      - `julia --project=. <<'EOF' ... println("dispersive airy ok") EOF`
+      - result: targeted Airy/stability regression passed with `dispersive airy ok`; stability control clamped an intentionally aggressive branch from `dt_raw=10.000146` to `dt_eff=8.062883e-5` while gradients remained finite
+      - `julia --project=. test/runtests.jl`
+      - result: full project test suite passed after the Airy/stability patch, with `DispersivePDE Module | 15/15` at the tail and no regressions in the existing WavePDE chess stack
+      - `julia --project=. test/runtests.jl`
+      - result: full project test suite passed again after the `WavePDEChess` public-surface integration, with `DispersivePDE Module | 19/19` and no integration regressions
+      - `julia --project=. test/runtests.jl`
+      - result: full project test suite passed again after the generic-core integration, with `DispersivePDE Module | 21/21`; the new regression verified that `ChessModel` can run with `DispersionConfig` as its `core` on a shorter runtime sequence than the configured maximum
+      - `julia --project=. -e 'module AiryEntryPointSmoke; include("scripts/train_chess_airy_lm.jl"); @assert isdefined(@__MODULE__, :run_chess_airy_lm_training); println("airy_entrypoint_ok"); end'`
+      - result: standalone Airy training entrypoint loaded successfully with `airy_entrypoint_ok`
+      - `julia --project=. test/runtests.jl`
+      - result: full project test suite passed again after adding `AiryPDEConfig`, `chess_airy_11m_config()`, and the Airy training entrypoints, with `DispersivePDE Module | 21/21`
+    - best current checkpoint/config recommendation:
+      - `src/DisparsivePDE.jl` is now usable through `WavePDEChess`, through the existing model-config surface as an alternative `core`, and through dedicated Airy training entrypoints; keep it as an Airy-style PDE submodule unless there is a reason to flatten it into the top-level architecture/config path
+    - unresolved issue / next action:
+      - if this module is meant to become production code, the next step is deciding whether it should be integrated into the package exports and model configuration surface rather than remaining an include-only standalone module
+      - if it stays on the PDE path, the next serious upgrade is deciding between exact semigroup stepping versus multi-substep operator splitting so the block contract is as explicit as the main WavePDE solver contract
 - Signature: Codex (GPT-5)

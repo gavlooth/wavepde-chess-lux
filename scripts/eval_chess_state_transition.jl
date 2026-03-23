@@ -18,18 +18,21 @@ function run_eval_chess_state_transition()
     data_dir = state_transition_eval_data_dir()
     batch_size = env_int("WAVEPDE_BATCH_SIZE", 8)
     policy_condition_mode = env_symbol("WAVEPDE_POLICY_CONDITION_MODE", :state_only)
+    state_target_mode = env_symbol("WAVEPDE_STATE_TARGET_MODE", :full)
 
     result = evaluate_state_transition_checkpoint(
         checkpoint_path,
         data_dir;
         batch_size=batch_size,
         policy_condition_mode=policy_condition_mode,
+        state_target_mode=state_target_mode,
     )
 
     println("entrypoint=eval_chess_state_transition")
     println("checkpoint=$(result.checkpoint_path)")
     println("data_dir=$(result.data_dir)")
     println("policy_condition_mode=$(policy_condition_mode)")
+    println("state_target_mode=$(state_target_mode)")
     println("num_examples=$(result.num_examples)")
     println("num_tokens=$(result.num_tokens)")
     println("token_loss=$(result.token_loss)")
@@ -47,6 +50,7 @@ function run_eval_chess_state_transition()
     println("state_slot_pressure_token_accuracy=$(result.state_slot_family_metrics.pressure_counts.token_accuracy)")
     println("successor_valid_board_rate=$(result.successor_legality_metrics.valid_board_rate)")
     println("successor_reachable_rate=$(result.successor_legality_metrics.reachable_rate)")
+    println("successor_reachable_strict_rate=$(result.successor_legality_metrics.reachable_strict_rate)")
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

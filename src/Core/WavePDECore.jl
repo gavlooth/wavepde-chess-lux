@@ -4,6 +4,8 @@ Base.@kwdef struct WavePDECoreConfig
     solver_steps::Int = 4
     dt_init::Float32 = 0.05f0
     norm_eps::Float32 = 1f-5
+    cfl_safety_factor::Float32 = 0.95f0
+    cfl_eps::Float32 = 1f-6
 end
 
 @inline softplus_scalar(x::T) where {T<:Real} = log1p(exp(-abs(x))) + max(x, zero(T))
@@ -75,6 +77,8 @@ struct WavePDESpectralMixer{T} <: Lux.AbstractLuxLayer
     solver_steps::Int
     dt_init::T
     dt_floor::T
+    cfl_safety_factor::T
+    cfl_eps::T
 end
 
 function validate_wavepde_input(layer::WavePDESpectralMixer, x::AbstractArray)
@@ -94,6 +98,8 @@ function Lux.initialparameters(rng::AbstractRNG, layer::WavePDESpectralMixer)
     layer.solver_steps > 0 || throw(ArgumentError("solver_steps must be positive"))
     layer.dt_init > 0 || throw(ArgumentError("dt_init must be positive"))
     layer.dt_floor >= 0 || throw(ArgumentError("dt_floor must be non-negative"))
+    zero(layer.cfl_safety_factor) < layer.cfl_safety_factor < one(layer.cfl_safety_factor) || throw(ArgumentError("cfl_safety_factor must be in (0, 1)."))
+    layer.cfl_eps > 0 || throw(ArgumentError("cfl_eps must be positive"))
     return (
         c_weight=glorot_uniform(rng, layer.d_model, layer.d_model),
         c_bias=zeros(Float32, layer.d_model),
@@ -105,18 +111,40 @@ end
 
 Lux.initialstates(::AbstractRNG, ::WavePDESpectralMixer) = NamedTuple()
 
+function wavepde_cfl_control(
+    c::AbstractArray{T},
+    dt_raw::T,
+    cfl_safety_factor::T,
+    cfl_eps::T,
+) where {T<:AbstractFloat}
+    max_c = max(maximum(c), cfl_eps)
+    max_dt = cfl_safety_factor / (max_c + cfl_eps)
+    dt = min(dt_raw, max_dt)
+    raw_cfl = dt_raw * max_c
+    clamped = dt < dt_raw
+    return dt, raw_cfl, clamped
+end
+
+function maybe_warn_wavepde_stability(dt_raw::T, raw_cfl::T, clamped::Bool, cfl_safety_factor::T) where {T<:AbstractFloat}
+    clamped || return nothing
+    @warn "WavePDESpectralMixer CFL control clamped dt: raw dt * max(c) = $raw_cfl exceeded safety factor $cfl_safety_factor"
+    return nothing
+end
+
 function (layer::WavePDESpectralMixer)(x::AbstractArray{T, 3}, ps, st) where {T<:AbstractFloat}
     validate_wavepde_input(layer, x)
     c = softplus_scalar.(linear1x1(x, ps.c_weight, ps.c_bias)) .+ layer.dt_floor
     gamma = softplus_scalar.(linear1x1(x, ps.gamma_weight, ps.gamma_bias))
-    dt = softplus_scalar(ps.log_dt) + layer.dt_floor
+    dt_raw = softplus_scalar(ps.log_dt) + layer.dt_floor
+    dt, raw_cfl, clamped = wavepde_cfl_control(c, dt_raw, layer.cfl_safety_factor, layer.cfl_eps)
 
     u = x
     v = zero(x)
     c_sq = c .* c
     damping_split = exp.(-gamma .* (dt / 2))
-    max_wave_cfl = dt * maximum(c)
-    max_wave_cfl < one(T) || @warn "WavePDESpectralMixer stability heuristic exceeded: dt * max(c) = $max_wave_cfl >= 1"
+    Zygote.ignore() do
+        maybe_warn_wavepde_stability(dt_raw, raw_cfl, clamped, layer.cfl_safety_factor)
+    end
 
     for _ in 1:layer.solver_steps
         u, v = split_damped_leapfrog_step(u, v, c_sq, damping_split, dt)
@@ -130,13 +158,22 @@ struct WavePDEBlock{N, M} <: Lux.AbstractLuxLayer
     mixer::M
 end
 
-function WavePDEBlock(d_model::Int, solver_steps::Int, dt_init::Float32, norm_eps::Float32)
+function WavePDEBlock(
+    d_model::Int,
+    solver_steps::Int,
+    dt_init::Float32,
+    norm_eps::Float32,
+    cfl_safety_factor::Float32,
+    cfl_eps::Float32,
+)
     d_model > 0 || throw(ArgumentError("d_model must be positive"))
     solver_steps > 0 || throw(ArgumentError("solver_steps must be positive"))
     dt_init > 0 || throw(ArgumentError("dt_init must be positive"))
     norm_eps > 0 || throw(ArgumentError("norm_eps must be positive"))
+    0f0 < cfl_safety_factor < 1f0 || throw(ArgumentError("cfl_safety_factor must be in (0, 1)."))
+    cfl_eps > 0f0 || throw(ArgumentError("cfl_eps must be positive"))
     norm = RMSNormLayer(d_model, norm_eps)
-    mixer = WavePDESpectralMixer(d_model, solver_steps, dt_init, 1f-4)
+    mixer = WavePDESpectralMixer(d_model, solver_steps, dt_init, 1f-4, cfl_safety_factor, cfl_eps)
     return WavePDEBlock(norm, mixer)
 end
 
@@ -168,7 +205,19 @@ function WavePDECore(config::WavePDECoreConfig)
     config.solver_steps > 0 || throw(ArgumentError("solver_steps must be positive"))
     config.dt_init > 0 || throw(ArgumentError("dt_init must be positive"))
     config.norm_eps > 0 || throw(ArgumentError("norm_eps must be positive"))
-    blocks = ntuple(_ -> WavePDEBlock(config.d_model, config.solver_steps, config.dt_init, config.norm_eps), config.n_layer)
+    0f0 < config.cfl_safety_factor < 1f0 || throw(ArgumentError("cfl_safety_factor must be in (0, 1)."))
+    config.cfl_eps > 0f0 || throw(ArgumentError("cfl_eps must be positive"))
+    blocks = ntuple(
+        _ -> WavePDEBlock(
+            config.d_model,
+            config.solver_steps,
+            config.dt_init,
+            config.norm_eps,
+            config.cfl_safety_factor,
+            config.cfl_eps,
+        ),
+        config.n_layer,
+    )
     norm = RMSNormLayer(config.d_model, config.norm_eps)
     return WavePDECore(config, blocks, norm)
 end

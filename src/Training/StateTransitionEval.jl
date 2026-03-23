@@ -111,6 +111,34 @@ def wavepde_state_is_reachable_from_source(source_tokens, target_tokens):
         if not target.is_valid():
             return False
 
+        target_key = (
+            target.board_fen(),
+            target.turn,
+            target.castling_rights,
+            target.ep_square,
+        )
+        for move in source.legal_moves:
+            candidate = source.copy(stack=False)
+            candidate.push(move)
+            candidate_key = (
+                candidate.board_fen(),
+                candidate.turn,
+                candidate.castling_rights,
+                candidate.ep_square,
+            )
+            if candidate_key == target_key:
+                return True
+        return False
+    except Exception:
+        return False
+
+def wavepde_state_is_strictly_reachable_from_source(source_tokens, target_tokens):
+    try:
+        source = wavepde_board_from_state_tokens(source_tokens)
+        target = wavepde_board_from_state_tokens(target_tokens)
+        if not target.is_valid():
+            return False
+
         target_fen = target.fen()
         for move in source.legal_moves:
             candidate = source.copy(stack=False)
@@ -196,15 +224,21 @@ function pack_state_transition_batch(
     batch_size::Int,
     max_seq_len::Int;
     policy_condition_mode::Symbol=:state_only,
+    state_target_mode::Symbol=:full,
 )
     subset = start_idx:min(start_idx + batch_size - 1, length(states))
     batch_states = states[subset]
     batch_next_states = next_states[subset]
     state_seq_len = length(first(batch_states))
+    state_target_mode = WavePDEChess.validate_state_target_mode(state_target_mode)
 
     if policy_condition_mode == :state_only
         inputs, targets = pack_state_transition_batch(states, next_states, start_idx, batch_size, max_seq_len)
-        target_mask = trues(size(targets))
+        target_mask = falses(size(targets))
+        for batch_idx in 1:size(targets, 2)
+            target_length = WavePDEChess.state_target_length(batch_next_states[batch_idx], state_target_mode)
+            target_mask[1:target_length, batch_idx] .= true
+        end
         source_states = zeros(Int32, state_seq_len, length(batch_states))
         for (batch_idx, state) in enumerate(batch_states)
             source_states[:, batch_idx] .= Int32.(state[1:state_seq_len])
@@ -230,8 +264,9 @@ function pack_state_transition_batch(
             conditioned = conditioned_sequences[batch_idx]
             next_state = batch_next_states[batch_idx]
             inputs[1:length(conditioned), batch_idx] .= conditioned
-            targets[1:length(next_state), batch_idx] .= Int32.(next_state)
-            target_mask[1:length(next_state), batch_idx] .= true
+            target_length = WavePDEChess.state_target_length(next_state, state_target_mode)
+            targets[1:target_length, batch_idx] .= Int32.(next_state[1:target_length])
+            target_mask[1:target_length, batch_idx] .= true
             source_states[:, batch_idx] .= Int32.(batch_states[batch_idx][1:state_seq_len])
         end
 
@@ -278,18 +313,22 @@ function successor_legality_metrics(source_states::AbstractMatrix{<:Integer}, pr
 
     valid_board_count = 0
     reachable_count = 0
+    strict_reachable_count = 0
     for batch_idx in 1:num_examples
         source_tokens = collect(Int.(view(source_states, :, batch_idx)))
         predicted_tokens = collect(Int.(view(predicted_states, :, batch_idx)))
         valid_board_count += Bool(pycall(py"wavepde_state_is_valid", PyAny, predicted_tokens))
         reachable_count += Bool(pycall(py"wavepde_state_is_reachable_from_source", PyAny, source_tokens, predicted_tokens))
+        strict_reachable_count += Bool(pycall(py"wavepde_state_is_strictly_reachable_from_source", PyAny, source_tokens, predicted_tokens))
     end
 
     total = Float64(num_examples)
     return (
         valid_board_rate=valid_board_count / total,
         reachable_rate=reachable_count / total,
+        reachable_strict_rate=strict_reachable_count / total,
         unreachable_rate=(num_examples - reachable_count) / total,
+        unreachable_strict_rate=(num_examples - strict_reachable_count) / total,
     )
 end
 
@@ -348,15 +387,30 @@ function evaluate_state_transition_batches(model, ps, st, states, next_states; b
 end
 
 function evaluate_state_transition_corpus(model, ps, st, corpus; batch_size::Int=8, policy_condition_mode::Symbol=:state_only)
+    state_target_mode = :full
+    return evaluate_state_transition_corpus(model, ps, st, corpus; batch_size=batch_size, policy_condition_mode=policy_condition_mode, state_target_mode=state_target_mode)
+end
+
+function evaluate_state_transition_corpus(
+    model,
+    ps,
+    st,
+    corpus;
+    batch_size::Int=8,
+    policy_condition_mode::Symbol=:state_only,
+    state_target_mode::Symbol=:full,
+)
+    state_target_mode = WavePDEChess.validate_state_target_mode(state_target_mode)
+    state_eval_len = WavePDEChess.state_target_length(first(corpus.active_next_states), state_target_mode)
     total_loss = 0.0
     total_tokens = 0
     total_correct_tokens = 0
     total_tokens_seen = 0
     total_exact_matches = 0
     total_examples = 0
-    source_state_cols = Matrix{Int32}(undef, size(first(corpus.active_states), 1), 0)
-    target_state_cols = Matrix{Int32}(undef, size(first(corpus.active_next_states), 1), 0)
-    predicted_state_cols = Matrix{Int32}(undef, size(first(corpus.active_next_states), 1), 0)
+    source_state_cols = Matrix{Int32}(undef, state_eval_len, 0)
+    target_state_cols = Matrix{Int32}(undef, state_eval_len, 0)
+    predicted_state_cols = Matrix{Int32}(undef, state_eval_len, 0)
     predicted_fact_cols = Matrix{Float32}(undef, length(WavePDEChess.CHESS_BOARD_TARGET_NAMES), 0)
     target_fact_cols = Matrix{Float32}(undef, length(WavePDEChess.CHESS_BOARD_TARGET_NAMES), 0)
 
@@ -380,10 +434,13 @@ function evaluate_state_transition_corpus(model, ps, st, corpus; batch_size::Int
                 batch_size,
                 file_max_seq_len;
                 policy_condition_mode=policy_condition_mode,
+                state_target_mode=state_target_mode,
             )
             loss, output = WavePDEChess.paired_token_prediction_loss(model, ps, st, inputs, targets, target_mask)
             logits = WavePDEChess.extract_proposer_logits(output)
             predicted_tokens = argmax_tokens(logits)
+            predicted_state_tokens = predicted_tokens[1:state_eval_len, :]
+            target_state_tokens = targets[1:state_eval_len, :]
             masked_correct = count(((predicted_tokens .== targets) .& target_mask))
             masked_token_count = count(target_mask)
 
@@ -392,16 +449,16 @@ function evaluate_state_transition_corpus(model, ps, st, corpus; batch_size::Int
             total_correct_tokens += masked_correct
             total_tokens_seen += masked_token_count
             total_exact_matches += count(
-                batch_idx -> all(view(predicted_tokens, 1:size(source_states, 1), batch_idx) .== view(targets, 1:size(source_states, 1), batch_idx)),
+                batch_idx -> all(view(predicted_tokens, :, batch_idx)[view(target_mask, :, batch_idx)] .== view(targets, :, batch_idx)[view(target_mask, :, batch_idx)]),
                 1:size(targets, 2),
             )
             total_examples += size(targets, 2)
-            source_state_cols = hcat(source_state_cols, source_states)
-            target_state_cols = hcat(target_state_cols, targets[1:size(source_states, 1), :])
-            predicted_state_cols = hcat(predicted_state_cols, predicted_tokens[1:size(source_states, 1), :])
+            source_state_cols = hcat(source_state_cols, source_states[1:state_eval_len, :])
+            target_state_cols = hcat(target_state_cols, target_state_tokens)
+            predicted_state_cols = hcat(predicted_state_cols, predicted_state_tokens)
 
-            predicted_fact_cols = hcat(predicted_fact_cols, state_fact_matrix(predicted_tokens[1:size(source_states, 1), :]))
-            target_fact_cols = hcat(target_fact_cols, state_fact_matrix(targets[1:size(source_states, 1), :]))
+            predicted_fact_cols = hcat(predicted_fact_cols, state_fact_matrix(predicted_state_tokens))
+            target_fact_cols = hcat(target_fact_cols, state_fact_matrix(target_state_tokens))
         end
     end
 
@@ -425,6 +482,7 @@ function evaluate_state_transition_checkpoint(
     data_dir::AbstractString;
     batch_size::Int=8,
     policy_condition_mode::Symbol=:state_only,
+    state_target_mode::Symbol=:full,
 )
     checkpoint = load_state_transition_checkpoint(checkpoint_path)
     corpus = WavePDEChess.StateTransitionParquetCorpus(data_dir; min_tokens=WavePDEChess.BOARD_STATE_SEQUENCE_LENGTH)
@@ -435,6 +493,7 @@ function evaluate_state_transition_checkpoint(
         corpus;
         batch_size=batch_size,
         policy_condition_mode=policy_condition_mode,
+        state_target_mode=state_target_mode,
     )
     return merge(
         (

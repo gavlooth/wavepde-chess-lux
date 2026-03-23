@@ -67,7 +67,7 @@ function run_policy_training(policy::Symbol)
         seed=21,
     )
 
-    checkpoint = train!(model, corpus, train_cfg)
+    checkpoint = WavePDEChess.train!(model, corpus, train_cfg)
     return initial_ps, checkpoint.parameters
 end
 
@@ -143,6 +143,28 @@ end
     hidden, _ = Lux.apply(core, embedded, core_ps, core_st)
     @test size(hidden) == size(embedded)
 
+    dt_safe, raw_cfl_safe, clamped_safe = WavePDEChess.wavepde_cfl_control(fill(0.5f0, 1, 1, 1), 0.1f0, 0.9f0, 1f-6)
+    @test !clamped_safe
+    @test dt_safe == 0.1f0
+    @test raw_cfl_safe ≈ 0.05f0 atol=1f-6
+
+    dt_clamped, raw_cfl_clamped, clamped = WavePDEChess.wavepde_cfl_control(fill(2.0f0, 1, 1, 1), 1.0f0, 0.9f0, 1f-6)
+    @test clamped
+    @test raw_cfl_clamped ≈ 2.0f0 atol=1f-5
+    @test dt_clamped * 2.0f0 <= 0.90001f0
+
+    # The CFL warning path must remain outside the differentiated graph.
+    mixer = WavePDEChess.WavePDESpectralMixer(16, 1, 0.05f0, 1f-4, 0.9f0, 1f-6)
+    mixer_ps = Lux.initialparameters(rng, mixer)
+    mixer_st = Lux.initialstates(rng, mixer)
+    mixer_input = rand(rng, Float32, 16, 32, 2)
+    unstable_mixer_ps = (; mixer_ps..., log_dt=10.0f0)
+    unstable_grads = Zygote.gradient(
+        p -> sum(first(mixer(mixer_input, p, mixer_st))),
+        unstable_mixer_ps,
+    )[1]
+    @test parameter_count(unstable_grads) > 0
+
     proposer = ChessMoveHead(config.proposer)
     proposer_ps, proposer_st = Lux.setup(rng, proposer)
     proposer_logits, _ = proposer_output(proposer, hidden, adapter_ps, proposer_ps, proposer_st)
@@ -152,6 +174,19 @@ end
     @test preset.core.d_model == 288
     @test preset.core.n_layer == 20
     @test preset.max_seq_len == 1536
+
+    airy_preset = chess_airy_11m_config()
+    @test airy_preset.core isa DispersionConfig
+    @test airy_preset.core.channels == 288
+    @test airy_preset.core.n_layer == 20
+    @test airy_preset.max_seq_len == 1536
+
+    airy_model = ChessModel(AiryPDEConfig())
+    airy_ps, airy_st = Lux.setup(rng, airy_model)
+    airy_tokens = rand(rng, 0:27, 32, 2)
+    airy_logits, _ = Lux.apply(airy_model, airy_tokens, airy_ps, airy_st)
+    @test size(airy_logits) == (28, 32, 2)
+
 end
 
 @testset "MultiHead Composition" begin
@@ -352,6 +387,14 @@ end
     @test isapprox(family_metrics.pressure_counts.token_accuracy, 1.0; atol=1f-6)
     @test isapprox(legality_metrics.valid_board_rate, 1.0; atol=1f-6)
     @test isapprox(legality_metrics.reachable_rate, 1.0; atol=1f-6)
+    @test isapprox(legality_metrics.reachable_strict_rate, 1.0; atol=1f-6)
+
+    relaxed_target = copy(batch.target_tokens[:, 1:1])
+    relaxed_target[71, 1] = Int32(WavePDEChess.BOARD_STATE_HALFMOVE_BASE + 5)
+    relaxed_legality = successor_legality_metrics(batch.tokens[:, 1:1], relaxed_target)
+    @test isapprox(relaxed_legality.valid_board_rate, 1.0; atol=1f-6)
+    @test isapprox(relaxed_legality.reachable_rate, 1.0; atol=1f-6)
+    @test isapprox(relaxed_legality.reachable_strict_rate, 0.0; atol=1f-6)
 
     config = ChessModelConfig(
         adapter=ChessAdapterConfig(vocab_size=BOARD_STATE_VOCAB_SIZE, d_model=16, pad_token=0),
@@ -378,7 +421,7 @@ end
         seed=37,
     )
 
-    checkpoint = train!(model, corpus, train_cfg)
+    checkpoint = WavePDEChess.train!(model, corpus, train_cfg)
     @test isfile(train_cfg.checkpoint_path)
     @test length(checkpoint.losses) == 1
 end
@@ -405,6 +448,14 @@ end
         max_seq_len=BOARD_STATE_SEQUENCE_LENGTH + 1 + WavePDEChess.MAX_POLICY_ACTION_TOKENS,
         policy_condition_mode=:state_action,
     )
+    state_action_coarse_batch = WavePDEChess.sample_training_batch(
+        corpus,
+        rng;
+        batch_size=2,
+        max_seq_len=BOARD_STATE_SEQUENCE_LENGTH + 1 + WavePDEChess.MAX_POLICY_ACTION_TOKENS,
+        policy_condition_mode=:state_action,
+        state_target_mode=:coarse_only,
+    )
 
     @test size(state_only_batch.tokens) == (BOARD_STATE_SEQUENCE_LENGTH, 2)
     @test size(state_only_batch.target_mask) == size(state_only_batch.target_tokens)
@@ -412,6 +463,7 @@ end
     @test size(state_action_batch.tokens, 1) > size(state_only_batch.tokens, 1)
     @test size(state_action_batch.target_mask) == size(state_action_batch.target_tokens)
     @test count(state_action_batch.target_mask) == BOARD_STATE_SEQUENCE_LENGTH * 2
+    @test count(state_action_coarse_batch.target_mask) == BOARD_STATE_COARSE_LENGTH * 2
     @test state_action_batch.tokens[BOARD_STATE_SEQUENCE_LENGTH + 1, 1] == WavePDEChess.POLICY_ACTION_SEPARATOR_TOKEN
 
     model_config = ChessModelConfig(
@@ -440,7 +492,7 @@ end
         seed=53,
     )
 
-    checkpoint = train!(model, corpus, train_cfg)
+    checkpoint = WavePDEChess.train!(model, corpus, train_cfg)
     @test isfile(train_cfg.checkpoint_path)
     @test checkpoint.training_config.policy_condition_mode == :state_action
     @test length(checkpoint.losses) == 1
@@ -552,7 +604,7 @@ end
         seed=41,
     )
 
-    checkpoint = train!(model, corpus, train_cfg)
+    checkpoint = WavePDEChess.train!(model, corpus, train_cfg)
     @test isfile(train_cfg.checkpoint_path)
     @test length(checkpoint.losses) == 1
 
@@ -572,6 +624,7 @@ end
     @test 0.0 <= result.state_slot_family_metrics.pressure_counts.token_accuracy <= 1.0
     @test 0.0 <= result.successor_legality_metrics.valid_board_rate <= 1.0
     @test 0.0 <= result.successor_legality_metrics.reachable_rate <= 1.0
+    @test 0.0 <= result.successor_legality_metrics.reachable_strict_rate <= 1.0
 end
 
 @testset "State Transition Mode Comparison" begin
@@ -687,7 +740,7 @@ end
         seed=19,
     )
 
-    checkpoint = train!(model, corpus, train_cfg)
+    checkpoint = WavePDEChess.train!(model, corpus, train_cfg)
     @test isfile(train_cfg.checkpoint_path)
     @test length(checkpoint.losses) == 1
 end
@@ -733,7 +786,7 @@ end
         seed=23,
     )
 
-    checkpoint = train!(model, corpus, train_cfg)
+    checkpoint = WavePDEChess.train!(model, corpus, train_cfg)
     @test isfile(train_cfg.checkpoint_path)
     @test length(checkpoint.losses) == 1
 end
@@ -788,7 +841,7 @@ end
         seed=42,
     )
 
-    checkpoint = train!(model, corpus, train_cfg)
+    checkpoint = WavePDEChess.train!(model, corpus, train_cfg)
     @test isfile(train_cfg.checkpoint_path)
     @test length(checkpoint.losses) == 1
 end
@@ -845,7 +898,7 @@ end
         seed=31,
     )
 
-    checkpoint = train!(model, corpus, train_cfg)
+    checkpoint = WavePDEChess.train!(model, corpus, train_cfg)
     @test isfile(train_cfg.checkpoint_path)
     @test length(checkpoint.losses) == 1
 end
@@ -900,7 +953,7 @@ end
         seed=21,
     )
 
-    checkpoint = train!(model, corpus, train_cfg)
+    checkpoint = WavePDEChess.train!(model, corpus, train_cfg)
     @test isfile(train_cfg.checkpoint_path)
     @test length(checkpoint.losses) == 1
 end
@@ -1064,4 +1117,115 @@ end
     @test isfinite(result.hybrid.final_loss)
     @test isfinite(result.hybrid.final_state_loss)
     @test isfinite(result.hybrid.final_transcript_loss)
+end
+
+@testset "DispersivePDE Module" begin
+    rng = MersenneTwister(101)
+    @test isdefined(WavePDEChess, :DispersivePDE)
+    @test WavePDEChess.DispersionConfig === WavePDEChess.DispersivePDE.DispersionConfig
+    @test WavePDEChess.DispersiveBlock === WavePDEChess.DispersivePDE.DispersiveBlock
+    @test WavePDEChess.DispersiveStack === WavePDEChess.DispersivePDE.DispersiveStack
+
+    cfg = WavePDEChess.DispersionConfig(
+        channels=4,
+        n_layer=2,
+        length=8,
+        dt_init=0.1f0,
+        dt_floor=1f-4,
+        alpha_init=0.02f0,
+        alpha_floor=1f-4,
+        beta_init=0.03f0,
+        phase_limit=0.5f0,
+        decay_limit=0.5f0,
+        residual_init_scale=0.1f0,
+    )
+
+    model = WavePDEChess.DispersiveStack(2, cfg)
+    ps, st = Lux.setup(rng, model)
+    x = randn(rng, Float32, cfg.channels, cfg.length, 3)
+    y, st_next = Lux.apply(model, x, ps, st)
+    grid = WavePDEChess.frequency_grid(cfg.length)
+    grid_step = 2f0 * Float32(pi) / cfg.length
+
+    @test size(y) == size(x)
+    @test all(isfinite, y)
+    @test st_next == st
+    @test grid ≈ grid_step .* Float32[0, 1, 2, 3, -4, -3, -2, -1] atol=1f-6
+
+    dt_eff, airy_stats = WavePDEChess.DispersivePDE.airy_operator_control(
+        fill(0.5f0, cfg.channels),
+        fill(4.0f0, cfg.channels),
+        10.0f0,
+        grid,
+        cfg.decay_limit,
+        cfg.phase_limit,
+        cfg.stability_eps,
+    )
+    @test dt_eff < 10.0f0
+    @test airy_stats.clamped_decay || airy_stats.clamped_phase
+    @test airy_stats.max_phase > cfg.phase_limit
+
+    block = WavePDEChess.DispersiveBlock(cfg)
+    block_ps = Lux.initialparameters(rng, block)
+    block_st = Lux.initialstates(rng, block)
+    aggressive_ps = (; block_ps..., beta_raw=fill(200.0f0, cfg.channels), log_dt=Float32[10.0f0])
+    @test_logs (:warn, r"DispersiveBlock stability control clamped dt") first(block(x, aggressive_ps, block_st))
+
+    quiet_cfg = WavePDEChess.DispersionConfig(
+        channels=cfg.channels,
+        length=cfg.length,
+        dt_init=cfg.dt_init,
+        dt_floor=cfg.dt_floor,
+        alpha_init=cfg.alpha_init,
+        alpha_floor=cfg.alpha_floor,
+        beta_init=cfg.beta_init,
+        phase_limit=cfg.phase_limit,
+        decay_limit=cfg.decay_limit,
+        residual_init_scale=cfg.residual_init_scale,
+        norm_eps=cfg.norm_eps,
+        stability_eps=cfg.stability_eps,
+        warn_on_clamp=false,
+    )
+    quiet_block = WavePDEChess.DispersiveBlock(quiet_cfg)
+    quiet_block_ps = Lux.initialparameters(rng, quiet_block)
+    quiet_block_st = Lux.initialstates(rng, quiet_block)
+    quiet_aggressive_ps = (; quiet_block_ps..., beta_raw=fill(200.0f0, cfg.channels), log_dt=Float32[10.0f0])
+    clamp_grads = Zygote.gradient(
+        p -> sum(first(quiet_block(x, p, quiet_block_st))),
+        quiet_aggressive_ps,
+    )[1]
+    @test parameter_count(clamp_grads) > 0
+    @test all(isfinite, clamp_grads.in_weight)
+    @test all(isfinite, clamp_grads.beta_raw)
+    @test all(isfinite, clamp_grads.log_dt)
+
+    dataset = WavePDEChess.DispersivePDE.make_identity_dataset(cfg.channels, cfg.length, 2, 2; rng=rng)
+    result = WavePDEChess.DispersivePDE.train!(model, dataset; epochs=1, lr=1f-3, rng=rng)
+
+    @test length(result.losses) == 1
+    @test isfinite(result.losses[1])
+    @test tree_changed(ps, result.parameters)
+
+    model_config = ChessModelConfig(
+        adapter=ChessAdapterConfig(vocab_size=32, d_model=4, pad_token=0),
+        core=WavePDEChess.DispersionConfig(
+            channels=4,
+            n_layer=2,
+            length=12,
+            dt_init=0.05f0,
+            dt_floor=1f-4,
+            alpha_init=0.02f0,
+            alpha_floor=1f-4,
+            beta_init=0.03f0,
+            residual_init_scale=0.1f0,
+        ),
+        proposer=ChessMoveHeadConfig(vocab_size=32, d_model=4, tie_embeddings=false, bias=true),
+        max_seq_len=12,
+    )
+    sequence_model = ChessModel(model_config)
+    seq_ps, seq_st = Lux.setup(rng, sequence_model)
+    short_tokens = rand(rng, 0:31, 8, 2)
+    short_logits, _ = Lux.apply(sequence_model, short_tokens, seq_ps, seq_st)
+    @test size(short_logits) == (32, 8, 2)
+    @test all(isfinite, short_logits)
 end

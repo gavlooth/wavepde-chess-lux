@@ -1,6 +1,6 @@
 Base.@kwdef struct DualSurfaceStateModelConfig
     adapter::ChessAdapterConfig = ChessAdapterConfig(vocab_size=BOARD_STATE_VOCAB_SIZE, d_model=288, pad_token=0)
-    core::WavePDECoreConfig = WavePDECoreConfig()
+    core::SequenceCoreConfig = WavePDECoreConfig()
     state_head::ChessMoveHeadConfig = ChessMoveHeadConfig(vocab_size=BOARD_STATE_VOCAB_SIZE, d_model=288, tie_embeddings=true, bias=false)
     transcript_head::ChessMoveHeadConfig = ChessMoveHeadConfig(vocab_size=length(CHESS_TRANSCRIPT_STOI), d_model=288, tie_embeddings=false, bias=true)
     max_seq_len::Int = BOARD_STATE_SEQUENCE_LENGTH
@@ -42,9 +42,9 @@ end
 
 function validate_dual_surface_model_config(config::DualSurfaceStateModelConfig)
     config.max_seq_len > 0 || throw(ArgumentError("max_seq_len must be positive"))
-    config.adapter.d_model == config.core.d_model || throw(ArgumentError("adapter d_model must match core d_model"))
-    config.state_head.d_model == config.core.d_model || throw(ArgumentError("state_head d_model must match core d_model"))
-    config.transcript_head.d_model == config.core.d_model || throw(ArgumentError("transcript_head d_model must match core d_model"))
+    config.adapter.d_model == core_d_model(config.core) || throw(ArgumentError("adapter d_model must match core d_model"))
+    config.state_head.d_model == core_d_model(config.core) || throw(ArgumentError("state_head d_model must match core d_model"))
+    config.transcript_head.d_model == core_d_model(config.core) || throw(ArgumentError("transcript_head d_model must match core d_model"))
     config.state_head.vocab_size == config.adapter.vocab_size || throw(ArgumentError("state_head vocab_size must match adapter vocab_size"))
     config.transcript_head.tie_embeddings && throw(ArgumentError("transcript_head cannot tie embeddings to the state adapter because the vocabularies differ"))
     return nothing
@@ -55,7 +55,7 @@ function DualSurfaceStateModel(config::DualSurfaceStateModelConfig)
     return DualSurfaceStateModel(
         config,
         ChessInputAdapter(config.adapter),
-        WavePDECore(config.core),
+        build_sequence_core(config.core),
         ChessMoveHead(config.state_head),
         ChessMoveHead(config.transcript_head),
     )
