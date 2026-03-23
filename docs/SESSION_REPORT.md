@@ -16,44 +16,130 @@
   - added optional checker supervision plumbing for parquet-backed training batches and composite multi-head loss
   - added training freeze policies for `:full`, `:adapters_only`, and `:heads_only`
   - added transcript-based chess target utilities backed by `python-chess`, including board-fact extraction, candidate legality labels, and transition target extraction
+  - added PGN-backed state-transition utilities backed by `python-chess`, including raw `.pgn` discovery, per-ply state / successor-state extraction, and parquet export with `state_tokens` and `next_state_tokens`
+  - extended the PGN-derived state serialization to preserve the original 72-token coarse prefix while appending white/black attack maps plus check, pinned-pressure, king-pressure, mobility, and attacked-piece summaries
+  - added standalone policy-target utilities for legal candidate generation and one-hot labels over transcript or explicit legal-move contexts
+  - added transcript-parquet -> state-transition parquet conversion so the state-first regime can run on the existing transcript dataset when raw PGN is unavailable
   - added transcript-derived board-target loading through `ChessParquetCorpus(...; board_target_mode=:transcript_board_facts)`
+  - added `PolicyTargetBundle` plus helpers for policy candidate normalization, policy labels, and bundle construction
+  - added `StateTransitionParquetCorpus` plus paired proposer supervision for aligned `state_t -> state_t+1` token prediction
+  - added `board_state_tokens_from_transcript`, `board_probe_targets_from_payload`, `board_probe_targets_from_transcript`, and a richer `write_pgn_state_parquet` payload with attack/probe columns
   - integrated transition-consistency supervision into transcript-derived checker training through appended candidate contexts and an auxiliary transition loss
-  - added checker prediction metrics, rerank-vs-proposer comparison metrics, board-fact metrics, and candidate-legality metrics
+  - added checker prediction metrics, rerank-vs-proposer comparison metrics, board-fact metrics, candidate-legality metrics, and `board_probe_metrics` for attack-map / pressure summaries
+  - added legality-aware state-transition evaluation metrics with slot-family breakdowns for coarse state, attack maps, and pressure/count fields, plus successor-legality checks after decoding predicted states
+  - added policy-conditioned state-transition training with `policy_condition_mode=:state_only | :state_action`, masked successor loss over real `(state, move) -> next_state` batches, and `scripts/train_chess_state_policy.jl`
+  - added `compare_state_transition_training_modes(...)` plus `scripts/compare_chess_state_policy_modes.jl` for state-only vs move-conditioned successor comparisons
+  - added dual-surface training with state-transition loss primary and transcript/move-text prediction auxiliary through `DualSurfaceStateModel`, `scripts/train_chess_dual_surface.jl`, and `scripts/compare_chess_surface_modes.jl`
+  - hardened legality-aware evaluation so invalid decoded successor states are scored as invalid instead of crashing the run
   - added `scripts/train_chess_reasoning.jl` as the reasoning-oriented entrypoint over board-fact supervision
+  - added `scripts/build_chess_pgn_parquet.jl`, `scripts/build_chess_state_from_transcript_parquet.jl`, `scripts/train_chess_state_transition.jl`, and `scripts/eval_chess_state_transition.jl` for the first state-first training and evaluation path
   - added synthetic symbolic bridge-task generation plus `scripts/train_symbolic_bridge.jl`
   - added a transfer-comparison harness plus `scripts/run_symbolic_transfer_comparison.jl` for scratch vs transplanted-core symbolic runs
-  - added/updated tests for transcript targets, transcript-derived checker supervision, modular composition, and one-step training
+  - replaced the old completed modular backlog with a new state-first PGN architecture backlog and updated the next-steps plan accordingly
+  - added/updated tests for transcript targets, PGN-derived state transitions, transcript-derived checker supervision, modular composition, and one-step training
   - added root `AGENTS.md` and backlog/session-report guidance
 - experiment commands and key metrics
   - `julia --project=. test/runtests.jl`
-  - `julia --project=. -e 'include("scripts/train_chess_lm.jl"); include("scripts/train_chess_checker.jl"); include("scripts/train_chess_reasoning.jl"); include("scripts/train_chess_wavepde.jl"); include("scripts/train_symbolic_bridge.jl"); include("scripts/run_symbolic_transfer_comparison.jl"); println("script_load_ok")'`
+  - `julia --project=. -e 'include("scripts/train_chess_lm.jl"); include("scripts/train_chess_checker.jl"); include("scripts/train_chess_reasoning.jl"); include("scripts/train_chess_wavepde.jl"); include("scripts/build_chess_pgn_parquet.jl"); include("scripts/build_chess_state_from_transcript_parquet.jl"); include("scripts/train_chess_state_transition.jl"); include("scripts/train_chess_state_policy.jl"); include("scripts/eval_chess_state_transition.jl"); include("scripts/train_chess_dual_surface.jl"); include("scripts/compare_chess_surface_modes.jl"); include("scripts/compare_chess_state_policy_modes.jl"); include("scripts/train_symbolic_bridge.jl"); include("scripts/run_symbolic_transfer_comparison.jl"); println("state_surface_scripts_ok")'`
   - final passing test metrics:
     - `WavePDEChess`: 12/12 pass in about 2.5s
     - `MultiHead Composition`: 2/2 pass in about 0.4s
     - `MultiHead Reranking`: 5/5 pass in about 1.3s
     - `Checker Metrics`: 18/18 pass in about 0.3s
     - `Chess Transcript Targets`: 10/10 pass in about 0.4s
-    - `Transition Consistency Training`: 8/8 pass in about 30.2s
-    - `Symbolic Bridge Tasks`: 8/8 pass in about 2.7s
+    - `Policy Targets`: 13/13 pass in about 0.3s
+    - `PGN State Transitions`: 35/35 pass in about 24.6s
+    - `Board Probe Metrics`: 7/7 pass in about 0.0s
+    - `Transcript Parquet State Transitions`: 7/7 pass in about 0.3s
+    - `State Transition Evaluation`: 17/17 pass in about 1.0s
+    - `State Transition Mode Comparison`: 8/8 pass in about 2.1s
+    - `Transition Consistency Training`: 8/8 pass in about 4.8s
+    - `Symbolic Bridge Tasks`: 8/8 pass in about 1.1s
     - `DuckDB Training Path`: 7/7 pass in about 0.3s
-    - `Transcript-Derived Checker Targets`: 7/7 pass in about 0.7s
+    - `Transcript-Derived Checker Targets`: 7/7 pass in about 0.8s
     - `Checker Supervision`: 6/6 pass in about 0.9s
-    - `Training Policy`: 13/13 pass in about 2.2s
+    - `Training Policy`: 13/13 pass in about 2.6s
     - `Transfer Comparison`: 12/12 pass in about 1.0s
-  - script entrypoints loaded successfully via `script_load_ok`
+    - `Dual Surface Training`: 16/16 pass in about 2.2s
+    - `Surface Mode Comparison`: 8/8 pass in about 2.0s
+  - script entrypoints loaded successfully via `state_surface_scripts_ok`
   - synthetic one-step training smoke runs logged:
     - `step=1 loss=4.5047 seq_len=6 file=toy.parquet`
     - `step=1 loss=4.358 seq_len=40 file=toy_transcript.parquet`
+    - `step=1 loss=2.1608 seq_len=210 file=pgn_state_transitions.parquet`
+    - `step=1 loss=2.0303 seq_len=210 file=pgn_state_transitions.parquet`
     - `step=1 loss=6.0687 seq_len=6 file=toy_checker.parquet`
     - `step=1 loss=5.1717 seq_len=41 file=toy_transition.parquet`
     - `step=1 loss=4.0279 seq_len=23 file=symbolic_bridge.parquet`
+  - current legality-aware eval verification on the live tree:
+    - `julia --project=. test/runtests.jl`
+    - `PGN State Transitions`: 35/35 pass
+    - `Board Probe Metrics`: 7/7 pass
+    - `Transcript Parquet State Transitions`: 7/7 pass
+    - `State Transition Evaluation`: 17/17 pass
+    - `State Transition Mode Comparison`: 8/8 pass
+    - `Dual Surface Training`: 16/16 pass
+    - `Surface Mode Comparison`: 8/8 pass
+    - new slot-family, successor-legality, state/policy comparison, and dual-surface assertions passed
+  - real-PGN runtime on a Hikaru archive slice:
+    - train/eval split: `72` training games and `16` held-out games from chess.com Hikaru `2014-01` / `2014-02`
+    - state-first train command: `CHESS_PGN_SOURCE=.../tmp/state_first_runtime/pgn_train CHESS_DATA_DIR=.../tmp/state_first_runtime/state_train WAVEPDE_CHECKPOINT=.../tmp/state_first_runtime/checkpoints/state_first_checkpoint.jls WAVEPDE_MAX_ITERS=20 WAVEPDE_BATCH_SIZE=8 WAVEPDE_LOG_INTERVAL=5 WAVEPDE_FILE_ROTATE=10 julia --project=. scripts/train_chess_state_transition.jl`
+    - transcript-baseline train command: `julia --project=. tmp/state_first_runtime/train_transcript_baseline.jl`
+    - state-first checkpoint final training loss: `0.63200325`
+    - transcript-baseline checkpoint final training loss: `3.1021914`
+  - real-PGN state-first held-out evaluation on the full `16`-game split:
+    - `WAVEPDE_CHECKPOINT=tmp/state_first_runtime/checkpoints/state_first_checkpoint.jls CHESS_EVAL_DIR=tmp/state_first_runtime/state_eval julia --project=. scripts/eval_chess_state_transition.jl`
+    - `num_examples=1278`
+    - `num_tokens=268380`
+    - `token_loss=0.6499083414324013`
+    - `approx_perplexity=1.915365261331596`
+    - `exact_slot_accuracy=0.9324279007377599`
+    - `board_fact_overall_accuracy=0.8744783515910276`
+    - `state_slot_coarse_token_accuracy=0.9419557468266389`
+    - `state_slot_attack_token_accuracy=0.9316864730046949`
+    - `state_slot_pressure_token_accuracy=0.8733176838810641`
+    - `successor_valid_board_rate=1.0`
+    - `successor_reachable_rate=0.0`
+  - matched runtime comparison on a smaller held-out subset used for faster decision-grade turnaround:
+    - state-first small eval: `num_examples=338`, `num_tokens=70980`, `token_loss=0.5157125546382024`, `approx_perplexity=1.6748314856572741`, `exact_slot_accuracy=0.9462102000563539`, `board_fact_overall_accuracy=0.8777120315581854`
+    - transcript-baseline small eval: `num_tokens=51314`, `token_loss=4.164839735312506`, `approx_perplexity=64.38236339724513`, `token_accuracy=0.19747047589351835`
+  - transcript-baseline held-out evaluation on the full tokenized eval split:
+    - `checkpoint=tmp/state_first_runtime/checkpoints/transcript_baseline_checkpoint.jls`
+    - `data_dir=tmp/state_first_runtime/tokenized_eval`
+    - `token_loss=4.000507242441453`
+    - `approx_perplexity=54.62585155716627`
+    - `token_accuracy=0.2171683571640584`
+    - `num_tokens=195406`
+  - symbolic transfer rerun from the real-PGN state-first checkpoint:
+    - `WAVEPDE_SOURCE_CHECKPOINT=tmp/state_first_runtime/checkpoints/state_first_checkpoint.jls WAVEPDE_SYMBOLIC_OUTPUT_DIR=tmp/state_first_runtime/symbolic_from_state_first julia --project=. scripts/run_symbolic_transfer_comparison.jl`
+    - `scratch_full final_loss=15.10855`
+    - `chess_core_frozen final_loss=15.185317`
+    - `chess_core_finetune final_loss=14.959879`
+  - staged chess-language-model training and evaluation on `tmp_download/stable_0.parquet`:
+    - train command: `julia --project=. /tmp/wavepde_train_cp6.jl`
+    - eval command: `julia --project=. /tmp/wavepde_eval_cp6.jl`
+    - data split: `90/10` using `__index_level_0__ % 10` into `checkpoints/cp6_run_20260323/train/` and `checkpoints/cp6_run_20260323/val/`
+    - model/training regime: proposer-only `WavePDEChessLM`, `d_model=128`, `n_layer=8`, `max_seq_len=256`, `solver_steps=2`, `batch_size=8`, `lr=6e-4`, `300` total steps saved as six 50-step checkpoints
+    - staged checkpoint losses:
+      - `checkpoint_01`: train `11.282334`, val `8.285687`
+      - `checkpoint_02`: train `5.1939793`, val `2.5823703`
+      - `checkpoint_03`: train `2.015479`, val `1.7714115`
+      - `checkpoint_04`: train `1.6528991`, val `1.5196481`
+      - `checkpoint_05`: train `1.3476123`, val `1.1623056`
+      - `checkpoint_06`: train `0.9558252`, staged val `0.74563473`
+    - full held-out evaluation for `checkpoint_06`: `5208` validation games, token-weighted val loss `0.7411626222129974`, approximate perplexity `2.0983737127576156`
 - best current checkpoint/config recommendation
-  - current best code path is the modular `ChessModel` built from `chess_mamba_11m_config()`
-  - use `scripts/train_chess_wavepde.jl` with real parquet data in `CHESS_DATA_DIR`
-  - no meaningful trained checkpoint is recommended yet because only smoke-test and synthetic one-step runs were executed
+  - the current best abstraction-oriented code path is the new PGN-derived state-transition route through `scripts/train_chess_state_transition.jl`
+  - for raw chess data, point `CHESS_PGN_SOURCE` at `.pgn` files and let the entrypoint derive parquet state transitions automatically
+  - when raw PGN is not available but transcript parquet is, use `scripts/build_chess_state_from_transcript_parquet.jl` to derive the same state-transition training surface
+  - use `scripts/train_chess_state_policy.jl` when testing move-conditioned successor training and `scripts/train_chess_dual_surface.jl` when transcript reconstruction is needed as an auxiliary surface
+  - use `scripts/train_chess_wavepde.jl` only when the goal is staying on the existing transcript-token baseline
+  - the best available abstraction-oriented checkpoint from this repo is `/home/christos/code/julia/wavepde-chess-lux/tmp/state_first_runtime/checkpoints/state_first_checkpoint.jls`
+  - the earlier `/home/christos/code/julia/wavepde-chess-lux/checkpoints/cp6_run_20260323/checkpoint_06.jls` remains only a reduced-config transcript baseline reference
 - unresolved issues and next actions
-  - the symbolic transfer harness is shipped, but it still needs empirical runs against a meaningful chess checkpoint
-  - the transition-consistency path currently shares the checker head and may need a dedicated probe if the supervision surface grows
+  - scale the new state-first runtime beyond the current Hikaru sample and keep held-out successor-state evaluation in place
+  - `successor_reachable_rate` is still `0.0` even when decoded boards are valid, so the next real regime test is larger move-conditioned training and/or legality-constrained decoding
+  - the transcript-side transition-consistency path is now a compatibility-only shared-checker path; future transition expansion should happen on the state/policy path instead
   - the current solver uses the split-damping variant already present in the workspace and still needs an explicit paper-fidelity decision
   - the next concrete work items are recorded in `docs/plans/modular-refactor-next-steps.md`
 - Signature: Codex (GPT-5)

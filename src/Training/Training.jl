@@ -16,6 +16,7 @@ Base.@kwdef struct TrainingConfig
     transition_candidates_per_example::Int = 1
     training_policy::Symbol = :full
     board_target_mode::Symbol = :none
+    policy_condition_mode::Symbol = :state_only
     checkpoint_path::String = joinpath(pwd(), "checkpoints", "wavepde_chess_checkpoint.jls")
     seed::Int = 1337
 end
@@ -32,6 +33,17 @@ mutable struct ChessParquetCorpus
     board_target_mode::Symbol
 end
 
+mutable struct StateTransitionParquetCorpus
+    db::DuckDB.DB
+    conn
+    files::Vector{String}
+    active_file::String
+    active_states::Vector{Vector{Int32}}
+    active_next_states::Vector{Vector{Int32}}
+    active_moves::Union{Nothing, Vector{String}}
+    min_tokens::Int
+end
+
 const CHECKER_COLUMN_CANDIDATES = (
     "checker_targets",
     "checker_target",
@@ -41,7 +53,9 @@ const CHECKER_COLUMN_CANDIDATES = (
 
 const TRAINING_POLICIES = (:full, :adapters_only, :heads_only)
 const BOARD_TARGET_MODES = (:none, :transcript_board_facts)
+const POLICY_CONDITION_MODES = (:state_only, :state_action)
 const TRANSCRIPT_COLUMN_CANDIDATES = ("transcript",)
+const MOVE_COLUMN_CANDIDATES = ("move_san",)
 
 function discover_parquet_files(data_dir::AbstractString)
     files = String[]
@@ -91,6 +105,27 @@ function find_transcript_column(columns::AbstractVector{<:AbstractString})
     return nothing
 end
 
+function find_state_tokens_column(columns::AbstractVector{<:AbstractString})
+    for candidate in STATE_TOKENS_COLUMN_CANDIDATES
+        candidate in columns && return candidate
+    end
+    return nothing
+end
+
+function find_next_state_tokens_column(columns::AbstractVector{<:AbstractString})
+    for candidate in NEXT_STATE_TOKENS_COLUMN_CANDIDATES
+        candidate in columns && return candidate
+    end
+    return nothing
+end
+
+function find_move_column(columns::AbstractVector{<:AbstractString})
+    for candidate in MOVE_COLUMN_CANDIDATES
+        candidate in columns && return candidate
+    end
+    return nothing
+end
+
 function parse_int_sequence(values)
     return Int32[x for x in values if !ismissing(x)]
 end
@@ -107,6 +142,13 @@ end
 function validate_board_target_mode(mode::Symbol)
     mode in BOARD_TARGET_MODES || throw(ArgumentError(
         "Unsupported board_target_mode $(mode). Supported modes are $(BOARD_TARGET_MODES).",
+    ))
+    return mode
+end
+
+function validate_policy_condition_mode(mode::Symbol)
+    mode in POLICY_CONDITION_MODES || throw(ArgumentError(
+        "Unsupported policy_condition_mode $(mode). Supported modes are $(POLICY_CONDITION_MODES).",
     ))
     return mode
 end
@@ -239,6 +281,46 @@ function load_tokenized_games(conn, path::AbstractString; min_tokens::Int=8, boa
     return games
 end
 
+function load_state_transition_examples(conn, path::AbstractString; min_tokens::Int=BOARD_STATE_SEQUENCE_LENGTH)
+    assert_real_parquet(path)
+    columns = parquet_column_names(conn, path)
+    state_column = find_state_tokens_column(columns)
+    next_state_column = find_next_state_tokens_column(columns)
+    move_column = find_move_column(columns)
+
+    state_column === nothing && throw(ArgumentError("State-transition parquet $(path) must include a state_tokens column."))
+    next_state_column === nothing && throw(ArgumentError("State-transition parquet $(path) must include a next_state_tokens column."))
+
+    select_columns = ["$(state_column) AS state_tokens", "$(next_state_column) AS next_state_tokens"]
+    move_column === nothing || push!(select_columns, "$(move_column) AS move_san")
+    rows = DBInterface.execute(
+        conn,
+        "SELECT $(join(select_columns, ", ")) FROM read_parquet('$(sql_escape(path))')",
+    )
+    states = Vector{Vector{Int32}}()
+    next_states = Vector{Vector{Int32}}()
+    moves = move_column === nothing ? nothing : String[]
+    for row in rows
+        state_tokens = parse_int_sequence(row[1])
+        next_state_tokens = parse_int_sequence(row[2])
+        length(state_tokens) >= min_tokens || continue
+        length(next_state_tokens) >= min_tokens || continue
+        length(state_tokens) == length(next_state_tokens) || throw(ArgumentError(
+            "State-transition length mismatch in $(path): got $(length(state_tokens)) and $(length(next_state_tokens)).",
+        ))
+        push!(states, state_tokens)
+        push!(next_states, next_state_tokens)
+        if moves !== nothing
+            move_san = row[3]
+            move_text = move_san === missing ? "" : String(move_san)
+            push!(moves, move_text)
+        end
+    end
+
+    isempty(states) && throw(ArgumentError("No usable state-transition examples found in $(path)."))
+    return states, next_states, moves
+end
+
 function ChessParquetCorpus(data_dir::AbstractString; min_tokens::Int=8, board_target_mode::Symbol=:none)
     files = discover_parquet_files(data_dir)
     isempty(files) && throw(ArgumentError("No parquet files found under $(data_dir)."))
@@ -268,6 +350,31 @@ function ChessParquetCorpus(data_dir::AbstractString; min_tokens::Int=8, board_t
     )
 end
 
+function StateTransitionParquetCorpus(data_dir::AbstractString; min_tokens::Int=BOARD_STATE_SEQUENCE_LENGTH)
+    files = discover_parquet_files(data_dir)
+    isempty(files) && throw(ArgumentError("No parquet files found under $(data_dir)."))
+
+    db = DuckDB.DB()
+    conn = DBInterface.connect(db)
+    active_file = first(files)
+    active_states, active_next_states, active_moves = load_state_transition_examples(
+        conn,
+        active_file;
+        min_tokens=min_tokens,
+    )
+
+    return StateTransitionParquetCorpus(
+        db,
+        conn,
+        files,
+        active_file,
+        active_states,
+        active_next_states,
+        active_moves,
+        min_tokens,
+    )
+end
+
 function reload_file!(corpus::ChessParquetCorpus, path::AbstractString)
     corpus.active_file = path
     corpus.active_games, corpus.active_checker_targets, corpus.checker_target_dim = load_training_examples(
@@ -280,7 +387,26 @@ function reload_file!(corpus::ChessParquetCorpus, path::AbstractString)
     return corpus
 end
 
+function reload_file!(corpus::StateTransitionParquetCorpus, path::AbstractString)
+    corpus.active_file = path
+    corpus.active_states, corpus.active_next_states, corpus.active_moves = load_state_transition_examples(
+        corpus.conn,
+        path;
+        min_tokens=corpus.min_tokens,
+    )
+    isempty(corpus.active_states) && throw(ArgumentError("No usable state-transition examples found in $(path)."))
+    return corpus
+end
+
 function maybe_rotate_file!(corpus::ChessParquetCorpus, rng::AbstractRNG, step::Int; every::Int)
+    if every > 0 && step > 1 && step % every == 0 && length(corpus.files) > 1
+        next_file = corpus.files[rand(rng, eachindex(corpus.files))]
+        next_file == corpus.active_file || reload_file!(corpus, next_file)
+    end
+    return corpus
+end
+
+function maybe_rotate_file!(corpus::StateTransitionParquetCorpus, rng::AbstractRNG, step::Int; every::Int)
     if every > 0 && step > 1 && step % every == 0 && length(corpus.files) > 1
         next_file = corpus.files[rand(rng, eachindex(corpus.files))]
         next_file == corpus.active_file || reload_file!(corpus, next_file)
@@ -294,6 +420,7 @@ function sample_training_batch(
     batch_size::Int,
     max_seq_len::Int,
     transition_candidates_per_example::Int=0,
+    policy_condition_mode::Symbol=:state_only,
 )
     sampled_games = Vector{Vector{Int32}}(undef, batch_size)
     sampled_checker_targets = corpus.active_checker_targets === nothing ? nothing : Vector{Vector{Float32}}(undef, batch_size)
@@ -359,6 +486,74 @@ function sample_batch(corpus::ChessParquetCorpus, rng::AbstractRNG; batch_size::
     return sample_training_batch(corpus, rng; batch_size=batch_size, max_seq_len=max_seq_len).tokens
 end
 
+function sample_training_batch(
+    corpus::StateTransitionParquetCorpus,
+    rng::AbstractRNG;
+    batch_size::Int,
+    max_seq_len::Int,
+    transition_candidates_per_example::Int=0,
+    policy_condition_mode::Symbol=:state_only,
+)
+    policy_condition_mode = validate_policy_condition_mode(policy_condition_mode)
+    sampled_states = Vector{Vector{Int32}}(undef, batch_size)
+    sampled_next_states = Vector{Vector{Int32}}(undef, batch_size)
+    sampled_moves = policy_condition_mode == :state_action ? Vector{String}(undef, batch_size) : String[]
+    max_batch_len = 0
+
+    for i in 1:batch_size
+        idx = rand(rng, eachindex(corpus.active_states))
+        state_tokens = corpus.active_states[idx]
+        next_state_tokens = corpus.active_next_states[idx]
+        sampled_states[i] = state_tokens
+        sampled_next_states[i] = next_state_tokens
+        if policy_condition_mode == :state_action
+            corpus.active_moves === nothing && throw(ArgumentError(
+                "policy_condition_mode=:state_action requires parquet rows with move_san values.",
+            ))
+            candidate = corpus.active_moves[idx]
+            isempty(candidate) && throw(ArgumentError(
+                "policy_condition_mode=:state_action requires non-empty move_san values in $(corpus.active_file).",
+            ))
+            conditioned_tokens = append_policy_action_tokens(state_tokens, candidate)
+            length(conditioned_tokens) <= max_seq_len || throw(ArgumentError(
+                "Conditioned state-action sequence length $(length(conditioned_tokens)) exceeds max_seq_len $(max_seq_len). Increase model.config.max_seq_len or reduce action-token length.",
+            ))
+            sampled_moves[i] = candidate
+            max_batch_len = max(max_batch_len, length(conditioned_tokens))
+        else
+            max_batch_len = max(max_batch_len, min(length(state_tokens), max_seq_len))
+        end
+    end
+
+    tokens = zeros(Int32, max_batch_len, batch_size)
+    target_tokens = zeros(Int32, max_batch_len, batch_size)
+    target_mask = falses(max_batch_len, batch_size)
+    for i in 1:batch_size
+        if policy_condition_mode == :state_action
+            conditioned_tokens = append_policy_action_tokens(sampled_states[i], sampled_moves[i])
+            tokens[1:length(conditioned_tokens), i] .= conditioned_tokens
+            target_length = length(sampled_next_states[i])
+            target_tokens[1:target_length, i] .= sampled_next_states[i]
+            target_mask[1:target_length, i] .= true
+        else
+            token_count = min(length(sampled_states[i]), max_batch_len)
+            tokens[1:token_count, i] .= sampled_states[i][1:token_count]
+            target_tokens[1:token_count, i] .= sampled_next_states[i][1:token_count]
+            target_mask[1:token_count, i] .= true
+        end
+    end
+
+    return (
+        tokens=tokens,
+        target_tokens=target_tokens,
+        target_mask=target_mask,
+    )
+end
+
+function sample_batch(corpus::StateTransitionParquetCorpus, rng::AbstractRNG; batch_size::Int, max_seq_len::Int)
+    return sample_training_batch(corpus, rng; batch_size=batch_size, max_seq_len=max_seq_len).tokens
+end
+
 function autoregressive_cross_entropy(logits::AbstractArray{T, 3}, targets::AbstractMatrix{<:Integer}) where {T<:AbstractFloat}
     _, seq_len, batch_size = size(logits)
     @assert seq_len == size(targets, 1) "Logit and target sequence lengths differ."
@@ -377,6 +572,35 @@ function autoregressive_cross_entropy(logits::AbstractArray{T, 3}, targets::Abst
         end
     end
 
+    return total / T(count)
+end
+
+function masked_cross_entropy(
+    logits::AbstractArray{T, 3},
+    targets::AbstractMatrix{<:Integer},
+    target_mask::AbstractMatrix{Bool},
+) where {T<:AbstractFloat}
+    _, seq_len, batch_size = size(logits)
+    @assert seq_len == size(targets, 1) "Logit and target sequence lengths differ."
+    @assert batch_size == size(targets, 2) "Logit and target batch sizes differ."
+    @assert size(target_mask) == size(targets) "Target mask shape $(size(target_mask)) must match targets $(size(targets))."
+
+    total = zero(T)
+    count = 0
+
+    for b in 1:batch_size
+        for t in 1:seq_len
+            target_mask[t, b] || continue
+            target_idx = Int(targets[t, b]) + 1
+            column = view(logits, :, t, b)
+            max_logit = maximum(column)
+            log_denom = max_logit + log(sum(exp.(column .- max_logit)))
+            total += log_denom - column[target_idx]
+            count += 1
+        end
+    end
+
+    count > 0 || throw(ArgumentError("Masked cross-entropy received an empty target mask."))
     return total / T(count)
 end
 
@@ -406,6 +630,12 @@ training_transition_tokens(batch::NamedTuple) = get(batch, :transition_tokens, n
 
 training_transition_targets(::AbstractMatrix) = nothing
 training_transition_targets(batch::NamedTuple) = get(batch, :transition_targets, nothing)
+
+training_target_tokens(::AbstractMatrix) = nothing
+training_target_tokens(batch::NamedTuple) = get(batch, :target_tokens, nothing)
+
+training_target_mask(::AbstractMatrix) = nothing
+training_target_mask(batch::NamedTuple) = get(batch, :target_mask, nothing)
 
 function validate_training_policy(policy::Symbol)
     policy in TRAINING_POLICIES || throw(ArgumentError(
@@ -472,6 +702,38 @@ function next_token_prediction_loss(model, ps, st, batch_tokens::AbstractMatrix{
     return autoregressive_cross_entropy(logits, targets), output
 end
 
+function paired_token_prediction_loss(
+    model,
+    ps,
+    st,
+    input_tokens::AbstractMatrix{<:Integer},
+    target_tokens::AbstractMatrix{<:Integer},
+    target_mask::Union{Nothing, AbstractMatrix{Bool}}=nothing,
+)
+    size(input_tokens) == size(target_tokens) || throw(ArgumentError(
+        "Paired token prediction expects matching input and target shapes, got $(size(input_tokens)) vs $(size(target_tokens)).",
+    ))
+    output, _ = Lux.apply(model, input_tokens, ps, st)
+    logits = extract_proposer_logits(output)
+    size(logits, 2) == size(target_tokens, 1) || throw(ArgumentError(
+        "Model output sequence length $(size(logits, 2)) does not match paired target length $(size(target_tokens, 1)).",
+    ))
+    size(logits, 3) == size(target_tokens, 2) || throw(ArgumentError(
+        "Model output batch size $(size(logits, 3)) does not match paired target batch size $(size(target_tokens, 2)).",
+    ))
+    loss = target_mask === nothing ? autoregressive_cross_entropy(logits, target_tokens) : masked_cross_entropy(logits, target_tokens, target_mask)
+    return loss, output
+end
+
+function proposer_prediction_loss(model, ps, st, batch)
+    target_tokens = training_target_tokens(batch)
+    target_mask = training_target_mask(batch)
+    if target_tokens === nothing
+        return next_token_prediction_loss(model, ps, st, training_tokens(batch))
+    end
+    return paired_token_prediction_loss(model, ps, st, training_tokens(batch), target_tokens, target_mask)
+end
+
 function checker_regression_loss(predictions::AbstractArray{T, 2}, targets::AbstractArray{<:Real, 2}) where {T<:AbstractFloat}
     size(predictions) == size(targets) || throw(ArgumentError(
         "Checker prediction and target shapes differ: got $(size(predictions)) vs $(size(targets)).",
@@ -487,7 +749,7 @@ function checker_regression_loss(predictions::AbstractArray{T, 2}, targets::Abst
 end
 
 function autoregressive_loss(model::ChessModel, ps, st, batch; checker_loss_weight::Real=1.0, transition_loss_weight::Real=0.0)
-    token_loss, _ = next_token_prediction_loss(model, ps, st, training_tokens(batch))
+    token_loss, _ = proposer_prediction_loss(model, ps, st, batch)
     return token_loss
 end
 
@@ -500,7 +762,7 @@ function autoregressive_loss(
     transition_loss_weight::Real=0.0,
 )
     token_batch = training_tokens(batch)
-    token_loss, output = next_token_prediction_loss(model, ps, st, token_batch)
+    token_loss, output = proposer_prediction_loss(model, ps, st, batch)
     total_loss = token_loss
 
     checker_targets = training_checker_targets(batch)
@@ -532,9 +794,10 @@ function save_checkpoint(path::AbstractString, payload)
     return path
 end
 
-function train!(model, corpus::ChessParquetCorpus, cfg::TrainingConfig)
+function train!(model, corpus, cfg::TrainingConfig)
     rng = MersenneTwister(cfg.seed)
     training_policy = validate_training_policy(cfg.training_policy)
+    policy_condition_mode = validate_policy_condition_mode(cfg.policy_condition_mode)
     ps, st = Lux.setup(rng, model)
     optimizer = Optimisers.Adam(cfg.learning_rate)
     opt_state = Optimisers.setup(optimizer, ps)
@@ -548,6 +811,7 @@ function train!(model, corpus::ChessParquetCorpus, cfg::TrainingConfig)
             batch_size=cfg.batch_size,
             max_seq_len=model.config.max_seq_len,
             transition_candidates_per_example=cfg.transition_candidates_per_example,
+            policy_condition_mode=policy_condition_mode,
         )
 
         loss = autoregressive_loss(

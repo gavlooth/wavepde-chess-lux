@@ -7,6 +7,7 @@ using Lux
 using Zygote
 
 include("../src/WavePDEChess.jl")
+include("../src/Training/CheckerMetrics.jl")
 include("../src/Training/SymbolicTasks.jl")
 include("../src/Training/TransferComparison.jl")
 using .WavePDEChess
@@ -68,6 +69,38 @@ function run_policy_training(policy::Symbol)
 
     checkpoint = train!(model, corpus, train_cfg)
     return initial_ps, checkpoint.parameters
+end
+
+function write_test_pgn(path::AbstractString)
+    open(path, "w") do io
+        write(io, """
+[Event "WavePDE Test"]
+[Site "Local"]
+[Date "2026.03.23"]
+[Round "1"]
+[White "White"]
+[Black "Black"]
+[Result "1-0"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 1-0
+""")
+    end
+    return path
+end
+
+function write_test_transcript_parquet(path::AbstractString)
+    conn = DBInterface.connect(DuckDB.DB, ":memory:")
+    DBInterface.execute(conn, """
+        CREATE TABLE toy AS
+        SELECT '1.e4 e5 2.Nf3 Nc6 3.Bb5 a6 4.Ba4 Nf6 5.O-O Be7' AS transcript
+        UNION ALL
+        SELECT '1.d4 d5 2.c4 e6 3.Nc3 Nf6 4.Bg5 Be7 5.e3 O-O' AS transcript
+        UNION ALL
+        SELECT '1.c4 e5 2.Nc3 Nf6 3.Nf3 Nc6 4.g3 d5 5.cxd5 Nxd5' AS transcript
+    """)
+    escaped_path = replace(path, "'" => "''")
+    DBInterface.execute(conn, "COPY toy TO '$escaped_path' (FORMAT PARQUET)")
+    return path
 end
 
 @testset "WavePDEChess" begin
@@ -234,6 +267,345 @@ end
     @test transition.targets[:, 1] == Float32[0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0]
     @test transition.targets[:, 2] == zeros(Float32, length(CHESS_BOARD_TARGET_NAMES))
     @test transition.targets[:, 3] == zeros(Float32, length(CHESS_BOARD_TARGET_NAMES))
+end
+
+@testset "Policy Targets" begin
+    transcript = "1.e4 e5 2.Nf3 Nc6 3.Bb5 a6 4.Ba4 Nf6"
+    transcript_candidates = policy_legal_candidates(transcript)
+    transcript_bundle = policy_target_bundle(transcript, "O-O")
+
+    @test transcript_bundle.candidates == transcript_candidates
+    @test sum(transcript_bundle.labels) == 1.0f0
+    @test transcript_bundle.candidates[transcript_bundle.target_index] == "O-O"
+    @test transcript_bundle.target_move == "O-O"
+
+    explicit_candidates = policy_legal_candidates(["Qh5", "Nf3", "Nf3", "O-O"])
+    explicit_bundle = policy_target_bundle(explicit_candidates, "Nf3")
+
+    @test explicit_candidates == ["Qh5", "Nf3", "O-O"]
+    @test explicit_bundle.labels == Float32[0.0, 1.0, 0.0]
+    @test policy_target_index(explicit_candidates, "O-O") == 3
+    @test_throws ArgumentError policy_target_bundle(explicit_candidates, "Qh4")
+
+    encoded_action = WavePDEChess.encode_policy_action_san("O-O")
+    conditioned_tokens = WavePDEChess.append_policy_action_tokens(Int32[1, 2, 3], "O-O")
+
+    @test !isempty(encoded_action)
+    @test all(token -> token >= WavePDEChess.POLICY_ACTION_TOKEN_BASE, encoded_action)
+    @test conditioned_tokens[1:3] == Int32[1, 2, 3]
+    @test conditioned_tokens[4] == WavePDEChess.POLICY_ACTION_SEPARATOR_TOKEN
+    @test conditioned_tokens[5:end] == encoded_action
+end
+
+@testset "PGN State Transitions" begin
+    rng = MersenneTwister(37)
+    tempdir = mktempdir()
+    pgn_path = write_test_pgn(joinpath(tempdir, "toy_game.pgn"))
+
+    discovered_files = discover_pgn_files(tempdir)
+    examples = parse_pgn_state_examples(tempdir)
+    first_example = first(examples)
+
+    @test discovered_files == [pgn_path]
+    @test length(examples) == 10
+    @test length(first_example.state_tokens) == BOARD_STATE_SEQUENCE_LENGTH
+    @test length(first_example.next_state_tokens) == BOARD_STATE_SEQUENCE_LENGTH
+    @test length(first_example.attacked_white) == 64
+    @test length(first_example.attacked_black) == 64
+    @test first_example.in_check == Float32[0, 0]
+    @test first_example.pinned_count == Float32[0, 0]
+    @test first_example.move_san == "e4"
+    @test first_example.state_tokens != first_example.next_state_tokens
+
+    probe = WavePDEChess.board_probe_targets_from_transcript("1.e4 e5 2.Nf3 Nc6 3.Bb5 a6 4.Ba4 Nf6 5.O-O Be7")
+    @test length(probe.attacked_white) == 64
+    @test length(probe.attacked_black) == 64
+    @test probe.in_check == Float32[0, 0]
+    @test length(probe.pinned_count) == 2
+    @test all(isfinite, probe.pinned_count)
+    @test length(probe.king_pressure) == 2
+    @test all(isfinite, probe.king_pressure)
+    @test length(probe.attacked_piece_count) == 2
+    @test probe.attacked_piece_count[2] >= 1
+    @test length(probe.mobility) == 2
+    @test all(>(0), probe.mobility)
+
+    parquet_dir = joinpath(tempdir, "dataset")
+    parquet_path = write_pgn_state_parquet(tempdir, parquet_dir)
+    @test isfile(parquet_path)
+
+    corpus = StateTransitionParquetCorpus(parquet_dir; min_tokens=BOARD_STATE_SEQUENCE_LENGTH)
+    @test corpus.active_moves !== nothing
+    @test first(corpus.active_moves) == "e4"
+    batch = WavePDEChess.sample_training_batch(
+        corpus,
+        rng;
+        batch_size=2,
+        max_seq_len=BOARD_STATE_SEQUENCE_LENGTH,
+    )
+    @test size(batch.tokens) == (BOARD_STATE_SEQUENCE_LENGTH, 2)
+    @test size(batch.target_tokens) == (BOARD_STATE_SEQUENCE_LENGTH, 2)
+    family_metrics = state_slot_family_metrics(batch.target_tokens, batch.target_tokens)
+    legality_metrics = successor_legality_metrics(batch.tokens, batch.target_tokens)
+    @test isapprox(family_metrics.coarse_state.token_accuracy, 1.0; atol=1f-6)
+    @test isapprox(family_metrics.attack_maps.exact_match_rate, 1.0; atol=1f-6)
+    @test isapprox(family_metrics.pressure_counts.token_accuracy, 1.0; atol=1f-6)
+    @test isapprox(legality_metrics.valid_board_rate, 1.0; atol=1f-6)
+    @test isapprox(legality_metrics.reachable_rate, 1.0; atol=1f-6)
+
+    config = ChessModelConfig(
+        adapter=ChessAdapterConfig(vocab_size=BOARD_STATE_VOCAB_SIZE, d_model=16, pad_token=0),
+        core=WavePDECoreConfig(d_model=16, n_layer=2, solver_steps=1, dt_init=0.05f0, norm_eps=1f-5),
+        proposer=ChessMoveHeadConfig(vocab_size=BOARD_STATE_VOCAB_SIZE, d_model=16, tie_embeddings=true, bias=false),
+        max_seq_len=BOARD_STATE_SEQUENCE_LENGTH,
+    )
+    model = WavePDEChessLM(config)
+    ps, st = Lux.setup(rng, model)
+    loss = WavePDEChess.autoregressive_loss(model, ps, st, batch)
+    grads = Zygote.gradient(p -> WavePDEChess.autoregressive_loss(model, p, st, batch), ps)[1]
+
+    @test isfinite(loss)
+    @test parameter_count(grads) > 0
+
+    train_cfg = TrainingConfig(
+        data_dir=parquet_dir,
+        batch_size=2,
+        max_iters=1,
+        log_interval=1,
+        min_tokens=BOARD_STATE_SEQUENCE_LENGTH,
+        train_file_update_interval=1,
+        checkpoint_path=joinpath(tempdir, "wavepde_state_transition_ckpt.jls"),
+        seed=37,
+    )
+
+    checkpoint = train!(model, corpus, train_cfg)
+    @test isfile(train_cfg.checkpoint_path)
+    @test length(checkpoint.losses) == 1
+end
+
+@testset "Policy Conditioned State Transitions" begin
+    rng = MersenneTwister(53)
+    tempdir = mktempdir()
+    pgn_path = write_test_pgn(joinpath(tempdir, "toy_game.pgn"))
+    parquet_dir = joinpath(tempdir, "dataset")
+    write_pgn_state_parquet(dirname(pgn_path), parquet_dir)
+
+    corpus = StateTransitionParquetCorpus(parquet_dir; min_tokens=BOARD_STATE_SEQUENCE_LENGTH)
+    state_only_batch = WavePDEChess.sample_training_batch(
+        corpus,
+        rng;
+        batch_size=2,
+        max_seq_len=BOARD_STATE_SEQUENCE_LENGTH,
+        policy_condition_mode=:state_only,
+    )
+    state_action_batch = WavePDEChess.sample_training_batch(
+        corpus,
+        rng;
+        batch_size=2,
+        max_seq_len=BOARD_STATE_SEQUENCE_LENGTH + 1 + WavePDEChess.MAX_POLICY_ACTION_TOKENS,
+        policy_condition_mode=:state_action,
+    )
+
+    @test size(state_only_batch.tokens) == (BOARD_STATE_SEQUENCE_LENGTH, 2)
+    @test size(state_only_batch.target_mask) == size(state_only_batch.target_tokens)
+    @test count(state_only_batch.target_mask) == BOARD_STATE_SEQUENCE_LENGTH * 2
+    @test size(state_action_batch.tokens, 1) > size(state_only_batch.tokens, 1)
+    @test size(state_action_batch.target_mask) == size(state_action_batch.target_tokens)
+    @test count(state_action_batch.target_mask) == BOARD_STATE_SEQUENCE_LENGTH * 2
+    @test state_action_batch.tokens[BOARD_STATE_SEQUENCE_LENGTH + 1, 1] == WavePDEChess.POLICY_ACTION_SEPARATOR_TOKEN
+
+    model_config = ChessModelConfig(
+        adapter=ChessAdapterConfig(vocab_size=WavePDEChess.STATE_ACTION_VOCAB_SIZE, d_model=16, pad_token=0),
+        core=WavePDECoreConfig(d_model=16, n_layer=2, solver_steps=1, dt_init=0.05f0, norm_eps=1f-5),
+        proposer=ChessMoveHeadConfig(vocab_size=WavePDEChess.STATE_ACTION_VOCAB_SIZE, d_model=16, tie_embeddings=true, bias=false),
+        max_seq_len=BOARD_STATE_SEQUENCE_LENGTH + 1 + WavePDEChess.MAX_POLICY_ACTION_TOKENS,
+    )
+    model = WavePDEChessLM(model_config)
+    ps, st = Lux.setup(rng, model)
+    loss = WavePDEChess.autoregressive_loss(model, ps, st, state_action_batch)
+    grads = Zygote.gradient(p -> WavePDEChess.autoregressive_loss(model, p, st, state_action_batch), ps)[1]
+
+    @test isfinite(loss)
+    @test parameter_count(grads) > 0
+
+    train_cfg = TrainingConfig(
+        data_dir=parquet_dir,
+        batch_size=2,
+        max_iters=1,
+        log_interval=1,
+        min_tokens=BOARD_STATE_SEQUENCE_LENGTH,
+        train_file_update_interval=1,
+        policy_condition_mode=:state_action,
+        checkpoint_path=joinpath(tempdir, "wavepde_state_action_ckpt.jls"),
+        seed=53,
+    )
+
+    checkpoint = train!(model, corpus, train_cfg)
+    @test isfile(train_cfg.checkpoint_path)
+    @test checkpoint.training_config.policy_condition_mode == :state_action
+    @test length(checkpoint.losses) == 1
+end
+
+@testset "Board Probe Metrics" begin
+    probe_metrics = WavePDEChess.CheckerMetrics.board_probe_metrics(
+        (
+            attacked_white=Float32[1 0; 0 1],
+            attacked_black=Float32[0 1; 1 0],
+            in_check=Float32[1 0; 0 1],
+            pinned_count=Float32[0 1; 1 2],
+            king_pressure=Float32[2 1; 0 0],
+            mobility=Float32[10 20; 30 40],
+            attacked_piece_count=Float32[1 0; 2 3],
+        ),
+        (
+            attacked_white=Float32[1 0; 0 1],
+            attacked_black=Float32[0 1; 1 0],
+            in_check=Float32[1 0; 0 1],
+            pinned_count=Float32[0 1; 1 2],
+            king_pressure=Float32[2 1; 0 0],
+            mobility=Float32[10 20; 30 40],
+            attacked_piece_count=Float32[1 0; 2 3],
+        ),
+    )
+
+    @test isapprox(probe_metrics.attacked_white.overall_accuracy, 1.0; atol=1f-6)
+    @test isapprox(probe_metrics.attacked_black.exact_match_rate, 1.0; atol=1f-6)
+    @test isapprox(probe_metrics.in_check.brier_score, 0.0; atol=1f-6)
+    @test isapprox(probe_metrics.pinned_count.mse, 0.0; atol=1f-6)
+    @test isapprox(probe_metrics.king_pressure.mae, 0.0; atol=1f-6)
+    @test isapprox(probe_metrics.mobility.rmse, 0.0; atol=1f-6)
+    @test isapprox(probe_metrics.attacked_piece_count.max_abs_error, 0.0; atol=1f-6)
+end
+
+@testset "Transcript Parquet State Transitions" begin
+    tempdir = mktempdir()
+    parquet_path = joinpath(tempdir, "toy_transcript.parquet")
+    conn = DBInterface.connect(DuckDB.DB, ":memory:")
+    DBInterface.execute(conn, """
+        CREATE TABLE toy AS
+        SELECT '1.e4 e5 2.Nf3 Nc6 3.Bb5 a6 4.Ba4 Nf6 5.O-O Be7' AS transcript
+        UNION ALL
+        SELECT '1.d4 d5 2.c4 e6 3.Nc3 Nf6 4.Bg5 Be7 5.e3 O-O' AS transcript
+    """)
+    escaped_parquet_path = replace(parquet_path, "'" => "''")
+    DBInterface.execute(conn, "COPY toy TO '$escaped_parquet_path' (FORMAT PARQUET)")
+
+    examples = parse_transcript_parquet_state_examples(tempdir)
+    @test length(examples) == 20
+    @test first(examples).move_san == "e4"
+    @test length(first(examples).state_tokens) == BOARD_STATE_SEQUENCE_LENGTH
+
+    output_dir = joinpath(tempdir, "state_dataset")
+    state_parquet = write_transcript_state_parquet(tempdir, output_dir)
+    @test isfile(state_parquet)
+
+    corpus = StateTransitionParquetCorpus(output_dir; min_tokens=BOARD_STATE_SEQUENCE_LENGTH)
+    @test !isempty(corpus.active_states)
+    @test length(first(corpus.active_states)) == BOARD_STATE_SEQUENCE_LENGTH
+    @test length(first(corpus.active_next_states)) == BOARD_STATE_SEQUENCE_LENGTH
+end
+
+@testset "State Transition Evaluation" begin
+    rng = MersenneTwister(41)
+    tempdir = mktempdir()
+    train_dir = joinpath(tempdir, "train")
+    eval_dir = joinpath(tempdir, "eval")
+    mkpath(train_dir)
+    mkpath(eval_dir)
+
+    write_test_pgn(joinpath(train_dir, "train_game.pgn"))
+    open(joinpath(eval_dir, "eval_game.pgn"), "w") do io
+        write(io, """
+[Event "WavePDE Eval"]
+[Site "Local"]
+[Date "2026.03.23"]
+[Round "1"]
+[White "White"]
+[Black "Black"]
+[Result "0-1"]
+
+1. d4 d5 2. c4 e6 3. Nc3 Nf6 4. Bg5 Be7 5. e3 O-O 0-1
+""")
+    end
+
+    train_parquet_dir = joinpath(tempdir, "train_parquet")
+    eval_parquet_dir = joinpath(tempdir, "eval_parquet")
+    write_pgn_state_parquet(train_dir, train_parquet_dir)
+    write_pgn_state_parquet(eval_dir, eval_parquet_dir)
+
+    config = ChessModelConfig(
+        adapter=ChessAdapterConfig(vocab_size=BOARD_STATE_VOCAB_SIZE, d_model=16, pad_token=0),
+        core=WavePDECoreConfig(d_model=16, n_layer=2, solver_steps=1, dt_init=0.05f0, norm_eps=1f-5),
+        proposer=ChessMoveHeadConfig(vocab_size=BOARD_STATE_VOCAB_SIZE, d_model=16, tie_embeddings=true, bias=false),
+        max_seq_len=BOARD_STATE_SEQUENCE_LENGTH,
+    )
+    model = WavePDEChessLM(config)
+    corpus = StateTransitionParquetCorpus(train_parquet_dir; min_tokens=BOARD_STATE_SEQUENCE_LENGTH)
+    train_cfg = TrainingConfig(
+        data_dir=train_parquet_dir,
+        batch_size=2,
+        max_iters=1,
+        log_interval=1,
+        min_tokens=BOARD_STATE_SEQUENCE_LENGTH,
+        train_file_update_interval=1,
+        checkpoint_path=joinpath(tempdir, "wavepde_state_eval_ckpt.jls"),
+        seed=41,
+    )
+
+    checkpoint = train!(model, corpus, train_cfg)
+    @test isfile(train_cfg.checkpoint_path)
+    @test length(checkpoint.losses) == 1
+
+    result = evaluate_state_transition_checkpoint(train_cfg.checkpoint_path, eval_parquet_dir; batch_size=2)
+    @test result.checkpoint_path == train_cfg.checkpoint_path
+    @test result.data_dir == eval_parquet_dir
+    @test result.num_examples > 0
+    @test result.num_tokens > 0
+    @test isfinite(result.token_loss)
+    @test 0.0 <= result.exact_slot_accuracy <= 1.0
+    @test 0.0 <= result.exact_sequence_match_rate <= 1.0
+    @test 0.0 <= result.board_fact_metrics.overall_accuracy <= 1.0
+    @test 0.0 <= result.board_fact_metrics.exact_match_rate <= 1.0
+    @test isfinite(result.board_fact_metrics.brier_score)
+    @test 0.0 <= result.state_slot_family_metrics.coarse_state.token_accuracy <= 1.0
+    @test 0.0 <= result.state_slot_family_metrics.attack_maps.exact_match_rate <= 1.0
+    @test 0.0 <= result.state_slot_family_metrics.pressure_counts.token_accuracy <= 1.0
+    @test 0.0 <= result.successor_legality_metrics.valid_board_rate <= 1.0
+    @test 0.0 <= result.successor_legality_metrics.reachable_rate <= 1.0
+end
+
+@testset "State Transition Mode Comparison" begin
+    tempdir = mktempdir()
+    pgn_dir = joinpath(tempdir, "pgn")
+    mkpath(pgn_dir)
+    write_test_pgn(joinpath(pgn_dir, "compare_game.pgn"))
+
+    train_parquet_dir = joinpath(tempdir, "train_parquet")
+    eval_parquet_dir = joinpath(tempdir, "eval_parquet")
+    write_pgn_state_parquet(pgn_dir, train_parquet_dir)
+    write_pgn_state_parquet(pgn_dir, eval_parquet_dir)
+
+    result = compare_state_transition_training_modes(
+        train_parquet_dir,
+        eval_parquet_dir;
+        d_model=8,
+        n_layer=1,
+        solver_steps=1,
+        batch_size=2,
+        learning_rate=1.0f-3,
+        max_iters=1,
+        seed=61,
+        output_dir=joinpath(tempdir, "compare_output"),
+    )
+
+    @test isfile(result.state_only.checkpoint_path)
+    @test isfile(result.state_action.checkpoint_path)
+    @test isfinite(result.state_only.final_loss)
+    @test isfinite(result.state_action.final_loss)
+    @test isfinite(result.state_only.eval.token_loss)
+    @test isfinite(result.state_action.eval.token_loss)
+    @test 0.0 <= result.state_only.eval.exact_slot_accuracy <= 1.0
+    @test 0.0 <= result.state_action.eval.exact_slot_accuracy <= 1.0
 end
 
 @testset "Transition Consistency Training" begin
@@ -599,4 +971,97 @@ end
     @test isfinite(result.scratch_full.final_loss)
     @test isfinite(result.chess_core_frozen.final_loss)
     @test isfinite(result.chess_core_finetune.final_loss)
+end
+
+@testset "Dual Surface Training" begin
+    rng = MersenneTwister(51)
+    tempdir = mktempdir()
+    transcript_path = write_test_transcript_parquet(joinpath(tempdir, "toy_transcript.parquet"))
+    state_dir = joinpath(tempdir, "state_dataset")
+    lm_dir = joinpath(tempdir, "transcript_lm")
+
+    state_parquet = write_transcript_state_parquet(dirname(transcript_path), state_dir)
+    lm_parquet = write_transcript_language_parquet(dirname(transcript_path), lm_dir)
+
+    @test isfile(state_parquet)
+    @test isfile(lm_parquet)
+
+    corpus = DualSurfaceParquetCorpus(state_dir; min_tokens=BOARD_STATE_SEQUENCE_LENGTH)
+    batch = sample_dual_surface_batch(
+        corpus,
+        rng;
+        batch_size=2,
+        max_seq_len=BOARD_STATE_SEQUENCE_LENGTH,
+    )
+
+    @test size(batch.tokens) == (BOARD_STATE_SEQUENCE_LENGTH, 2)
+    @test size(batch.target_tokens) == (BOARD_STATE_SEQUENCE_LENGTH, 2)
+    @test size(batch.transcript_targets) == (BOARD_STATE_SEQUENCE_LENGTH, 2)
+    @test size(batch.transcript_mask) == (BOARD_STATE_SEQUENCE_LENGTH, 2)
+    @test any(batch.transcript_mask)
+
+    config = DualSurfaceStateModelConfig(
+        adapter=ChessAdapterConfig(vocab_size=BOARD_STATE_VOCAB_SIZE, d_model=16, pad_token=0),
+        core=WavePDECoreConfig(d_model=16, n_layer=2, solver_steps=1, dt_init=0.05f0, norm_eps=1f-5),
+        state_head=ChessMoveHeadConfig(vocab_size=BOARD_STATE_VOCAB_SIZE, d_model=16, tie_embeddings=true, bias=false),
+        transcript_head=ChessMoveHeadConfig(vocab_size=length(WavePDEChess.CHESS_TRANSCRIPT_STOI), d_model=16, tie_embeddings=false, bias=true),
+        max_seq_len=BOARD_STATE_SEQUENCE_LENGTH,
+    )
+    model = DualSurfaceStateModel(config)
+    ps, st = Lux.setup(rng, model)
+    outputs, _ = Lux.apply(model, batch.tokens, ps, st)
+    total_loss, parts = dual_surface_loss(model, ps, st, batch)
+
+    @test size(outputs.state) == (BOARD_STATE_VOCAB_SIZE, BOARD_STATE_SEQUENCE_LENGTH, 2)
+    @test size(outputs.transcript) == (length(WavePDEChess.CHESS_TRANSCRIPT_STOI), BOARD_STATE_SEQUENCE_LENGTH, 2)
+    @test isfinite(total_loss)
+    @test isfinite(parts.state_loss)
+    @test isfinite(parts.transcript_loss)
+
+    train_cfg = DualSurfaceTrainingConfig(
+        data_dir=state_dir,
+        batch_size=2,
+        learning_rate=1.0f-3,
+        max_iters=1,
+        log_interval=1,
+        min_tokens=BOARD_STATE_SEQUENCE_LENGTH,
+        train_file_update_interval=1,
+        checkpoint_path=joinpath(tempdir, "dual_surface_ckpt.jls"),
+        seed=51,
+    )
+    checkpoint = train_dual_surface!(model, corpus, train_cfg)
+
+    @test isfile(train_cfg.checkpoint_path)
+    @test length(checkpoint.losses) == 1
+    @test length(checkpoint.state_losses) == 1
+    @test length(checkpoint.transcript_losses) == 1
+end
+
+@testset "Surface Mode Comparison" begin
+    tempdir = mktempdir()
+    transcript_path = write_test_transcript_parquet(joinpath(tempdir, "toy_transcript.parquet"))
+    state_dir = joinpath(tempdir, "state_dataset")
+    write_transcript_state_parquet(dirname(transcript_path), state_dir)
+
+    result = compare_surface_training_modes(
+        dirname(transcript_path),
+        state_dir;
+        d_model=8,
+        n_layer=1,
+        solver_steps=1,
+        batch_size=2,
+        learning_rate=1.0f-3,
+        max_iters=1,
+        seed=59,
+        output_dir=joinpath(tempdir, "surface_compare"),
+    )
+
+    @test isfile(result.transcript_first.checkpoint_path)
+    @test isfile(result.state_first.checkpoint_path)
+    @test isfile(result.hybrid.checkpoint_path)
+    @test isfinite(result.transcript_first.final_loss)
+    @test isfinite(result.state_first.final_loss)
+    @test isfinite(result.hybrid.final_loss)
+    @test isfinite(result.hybrid.final_state_loss)
+    @test isfinite(result.hybrid.final_transcript_loss)
 end

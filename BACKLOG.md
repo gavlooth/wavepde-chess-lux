@@ -1,251 +1,223 @@
-# Modular Refactor Backlog
+# State-First PGN Architecture Backlog
 
 Purpose:
 
-- separate the reusable `WavePDE` backbone from chess-specific surface logic
-- add proposer/checker structure without throwing away the current chess-trained core
-- prepare the repo for later domain transfer into logic/language reasoning tasks
+- accept raw `PGN` as a first-class ingestion format
+- stop treating chess notation as the primary training surface
+- train the `WavePDE` backbone on structured board-state and transition supervision
+- keep transcript generation only as an optional compatibility surface
 
 ---
 
-## Target Architecture
+## Current Architectural Direction
 
 ```text
-[Domain Tokens]
-      |
-      v
-+----------------------+
-| InputAdapter         |
-| chess / logic / lang |
-+----------------------+
-      |
-      v
-+----------------------+
-| WavePDECore          |
-| reusable backbone    |
-+----------------------+
-      |
-      +-----------------------+
-      |                       |
-      v                       v
-+------------------+   +------------------+
-| ProposerHead     |   | CheckerHead      |
-| domain-specific  |   | domain-specific  |
-+------------------+   +------------------+
+[PGN files]
+     |
+     v
++---------------------------+
+| PGN ingestion             |
+| per-ply move parsing      |
++---------------------------+
+     |
+     v
++---------------------------+
+| board-state serialization |
+| state_t / state_t+1       |
++---------------------------+
+     |
+     v
++---------------------------+
+| InputAdapter              |
+| state-token embeddings    |
++---------------------------+
+     |
+     v
++---------------------------+
+| WavePDECore               |
+| reusable backbone         |
++---------------------------+
+     |
+     +----------------------------+
+     |                            |
+     v                            v
++--------------------+   +----------------------+
+| transition/policy  |   | probe bundle         |
+| successor targets  |   | facts / legality /   |
+| legal-move scoring |   | tactical abstractions|
++--------------------+   +----------------------+
 ```
 
-Near-term chess version:
+Shipped first slice:
 
 ```text
-[Chess tokens]
-      |
-      v
-+------------------+
-| ChessInputAdapter|
-+------------------+
-      |
-      v
-+------------------+
-| WavePDECore      |
-+------------------+
-      |
-      +----------------------+
-      |                      |
-      v                      v
-+------------------+   +------------------+
-| ChessMoveHead    |   | ChessCheckerHead |
-+------------------+   +------------------+
+[PGN files]
+     |
+     v
++---------------------------+
+| PGN -> parquet builder    |
+| state_tokens             |
+| next_state_tokens        |
++---------------------------+
+     |
+     v
++---------------------------+
+| state-transition corpus   |
++---------------------------+
+     |
+     v
++---------------------------+
+| WavePDE chess model       |
+| paired token supervision  |
+| state_t -> state_t+1      |
++---------------------------+
 ```
 
 ---
 
 ## Epics
 
-### EPIC A. Split Current Chess Model Into Modules
+### EPIC A. PGN Ingestion Boundary
 
-- [x] A1. Extract `ChessInputAdapter`
-  - current: `TokenEmbedding`
-  - target: chess-specific input adapter module
-  - result: surface encoding isolated from the reusable core
+- [x] A1. Discover raw `.pgn` files from a file or directory source
+  - shipped: recursive PGN discovery and validation
 
-- [x] A2. Extract `WavePDECore`
-  - current: `WavePDEChessLM` owns blocks directly
-  - target: reusable module containing:
-    - WavePDE block stack
-    - final normalization
-    - core config
-  - result: backbone can be reused across domains
-
-- [x] A3. Extract `ChessMoveHead`
-  - current: tied logits are embedded in the main model
-  - target: standalone proposer head
-  - result: output projection becomes swappable
-
-- [x] A4. Compose top-level chess model from modules
-  - target:
-    - `ChessInputAdapter`
-    - `WavePDECore`
-    - `ChessMoveHead`
-  - result: main model becomes composition, not one monolith
-
-### EPIC B. Introduce Explicit Head Interfaces
-
-- [x] B1. Add `AbstractProposerHead`-style interface
-  - contract: hidden state -> logits or candidate scores
-
-- [x] B2. Add `AbstractCheckerHead`-style interface
-  - contract: hidden state -> consistency outputs
-  - first version can be a scalar or small predicate bundle
-
-- [x] B3. Add a multi-head composition model
-  - target:
-    - `ChessInputAdapter`
-    - `WavePDECore`
-    - `ChessMoveHead`
-    - `ChessCheckerHead`
-
-- [x] B4. Keep proposer and checker independent
-  - reason: later domain transfer should replace heads without rewriting the core
-
-### EPIC C. Make The Core Domain-Agnostic
-
-- [x] C1. Rename chess-specific core assumptions at the reusable boundary
+- [x] A2. Parse PGN into per-ply state-transition examples
   - shipped:
-    - reusable `AbstractInputAdapter` / `input_adapter_output` contract
-    - adapter-facing error text and interface path no longer hardcode chess-only assumptions
+    - mainline move parsing
+    - SAN move recording
+    - per-ply `state_t` and `state_t+1` extraction
 
-- [x] C2. Define generic core tensor contract
-  - input: `(d_model, seq_len, batch)`
-  - output: `(d_model, seq_len, batch)`
-
-- [x] C3. Separate config types
-  - `WavePDECoreConfig`
-  - `ChessAdapterConfig`
-  - `ChessHeadConfig`
-
-- [x] C4. Remove vocab/output assumptions from the core
-  - vocab belongs to adapters/heads, not the backbone
-
-### EPIC D. Add Checker Infrastructure
-
-- [x] D1. Add first `ChessCheckerHead`
-  - shipped: pooled checker head with scalar/vector score output
-  - remaining richer probe outputs belong in later checker/probe work
-
-- [x] D2. Add checker loss plumbing
+- [x] A3. Write derived state-transition parquet
   - shipped:
-    - proposer-only training still works for `ChessModel`
-    - `ChessMultiHeadModel` uses composite proposer + checker loss when checker targets are present
-    - parquet loader accepts optional checker supervision columns
+    - `state_tokens`
+    - `next_state_tokens`
+    - `move_san`
+    - `ply`
+    - `transcript`
 
-- [x] D3. Add proposer + checker inference path
+### EPIC B. Board-State Serialization Contract
+
+- [x] B1. Add a fixed-length board-state token serialization
   - shipped:
-    - proposer generates top-k candidates
-    - checker reranks candidates on appended-token contexts through the existing checker head
+    - 64 square occupancy slots
+    - side to move
+    - castling rights
+    - en passant file
+    - halfmove/fullmove buckets
 
-- [x] D4. Add checker metrics
+- [x] B2. Add transcript -> board-state extraction
   - shipped:
-    - generic checker prediction error metrics
-    - rerank-vs-proposer comparison metrics
-    - board-fact classification metrics with accuracy, exact-match, and Brier score
-    - candidate-legality metrics for board-derived legality labels
+    - transcript-derived board-state tokens for the current position
 
-### EPIC E. Add Latent-State Supervision
-
-- [x] E1. Add board-derived target extraction
+- [x] B3. Expand the state payload beyond coarse board facts
   - shipped:
-    - transcript normalization plus 28-token chess transcript encoding/decoding
-    - side to move, in-check, castling-rights, material-bucket, and game-phase targets
-    - legality labels for sampled SAN candidates
+    - white/black attack maps
+    - in-check and pinned-piece summaries
+    - king-pressure summaries
+    - mobility and attacked-piece-count summaries
+  - residual:
+    - repetition and irreversible-move context remain future extensions
 
-- [x] E2. Add probe heads
+### EPIC C. State-First Training Path
+
+- [x] C1. Add a state-transition parquet corpus
   - shipped:
-    - vector-valued `ChessCheckerHead` now serves as the first board-fact probe bundle
+    - `StateTransitionParquetCorpus`
+    - file rotation and batch sampling
 
-- [x] E3. Integrate transition-consistency targets into training
+- [x] C2. Add paired proposer supervision for `state_t -> state_t+1`
   - shipped:
-    - candidate-move transition target extraction for board facts at `t+1`
-    - appended-candidate transition contexts in training batches
-    - optional transition checker loss for transcript-derived training
+    - paired token loss on aligned state sequences
+    - reusable through the existing `train!` entrypoint
 
-- [x] E4. Extend dataset pipeline for auxiliary labels
+- [x] C3. Add a task-specific state-transition entrypoint
+  - shipped: `scripts/train_chess_state_transition.jl`
+
+- [x] C4. Add an evaluation harness for state-transition checkpoints
   - shipped:
-    - `ChessParquetCorpus(...; board_target_mode=:transcript_board_facts)` derives tokenized transcripts and board-fact checker targets directly from parquet transcript columns
+    - held-out paired state-transition loss
+    - exact slot and exact sequence accuracy
+    - board-fact recovery metrics for predicted successor states
 
-### EPIC F. Prepare For Domain Transfer
+### EPIC D. Policy / Action Modeling
 
-- [x] F1. Introduce `GenericInputAdapter` interface
-  - later implementations:
-    - `ChessInputAdapter`
-    - `LogicInputAdapter`
-    - `LanguageInputAdapter`
-
-- [x] F2. Introduce `GenericProposerHead` interface
-  - later implementations:
-    - `ChessMoveHead`
-    - `LogicStepHead`
-    - `ThoughtTokenHead`
-
-- [x] F3. Introduce `GenericCheckerHead` interface
-  - later implementations:
-    - `ChessCheckerHead`
-    - `LogicConsistencyHead`
-    - `LanguageArgumentChecker`
-
-- [x] F4. Add freeze/unfreeze policies
+- [x] D1. Add a legal-move policy target
   - shipped:
-    - train adapters only
-    - train heads only
-    - full fine-tune
+    - transcript-driven legal candidate generation
+    - explicit state-context candidate normalization
+    - one-hot policy labels over the legal set
+    - strict missing-target validation for training-time use
 
-### EPIC G. Build Bridge Tasks Before Language
-
-- [x] G1. Add synthetic symbolic tasks
+- [x] D2. Split successor-state prediction from action selection
   - shipped:
-    - propositional logic
-    - entailment
-    - contradiction detection
-    - simple rule chaining
+    - `policy_condition_mode=:state_only` keeps direct `state_t -> state_t+1`
+    - `policy_condition_mode=:state_action` trains `(state_t, move) -> state_t+1`
+    - masked paired loss keeps action-conditioning tokens out of successor targets
 
-- [x] G2. Reuse the same `WavePDECore` across those tasks
+- [x] D3. Compare next-state-only vs policy-conditioned successor training
   - shipped:
-    - symbolic bridge training path reuses the existing modular model stack and `WavePDECore`
+    - `compare_state_transition_training_modes(...)`
+    - `scripts/compare_chess_state_policy_modes.jl`
+    - smoke-tested comparison between `:state_only` and `:state_action`
 
-- [x] G3. Compare transfer settings
+### EPIC E. Probe Bundle For Abstraction Capture
+
+- [x] E1. Expand the checker/probe bundle beyond the current board-fact set
   - shipped:
-    - scratch full training
-    - chess-core init with frozen core
-    - chess-core init with fine-tuning
+    - white/black attack maps
+    - in-check indicators
+    - pinned-piece counts
+    - king-pressure summaries
+    - mobility summaries
+    - attacked-piece-count summaries
 
-### EPIC H. Repository Restructure
+- [x] E2. Decide whether transition supervision should keep sharing the checker head
+  - shipped decision:
+    - the transcript-side transition-consistency path remains a compatibility-layer use of the shared checker head
+    - the primary state-first path no longer depends on checker-head sharing for transition learning
+    - future transition expansion should happen on the state/policy path rather than by growing the shared transcript checker surface
 
-- [x] H1. Split file layout
-  - target:
-    - `src/Core/`
-    - `src/Adapters/`
-    - `src/Heads/`
-    - `src/Models/`
-    - `src/Training/`
+- [x] E3. Add legality-aware abstraction metrics beyond the shipped probe/eval surface
+  - shipped:
+    - probe metrics by concept family through `board_probe_metrics`
+    - state-transition exact slot and exact sequence accuracy through the evaluation harness
+    - board-fact recovery metrics for predicted successor states
+    - slot-family breakdowns across coarse state, attack maps, and pressure/count fields
+    - move legality after successor decoding
 
-- [x] H2. Move current monolith into modules
-  - current:
-    - `src/WavePDEChess.jl`
-  - target:
-    - `src/Core/WavePDECore.jl`
-    - `src/Adapters/ChessInputAdapter.jl`
-    - `src/Heads/ChessMoveHead.jl`
-    - `src/Models/ChessModel.jl`
+### EPIC F. Dual-Surface Compatibility
 
-- [x] H3. Add task-specific entrypoints
-  - shipped: `scripts/train_chess_lm.jl`
-  - shipped: `scripts/train_chess_checker.jl`
+- [x] F1. Keep transcript LM as an optional auxiliary objective, not the primary objective
+  - shipped:
+    - `DualSurfaceStateModel` keeps state-transition loss primary and transcript loss auxiliary
 
-- [x] H5. Add reasoning-oriented training entrypoint
-  - shipped: `scripts/train_chess_reasoning.jl`
+- [x] F2. Add transcript reconstruction or move-text generation from state-derived latents
+  - shipped:
+    - auxiliary `move_san` text prediction from state-derived latents in the dual-surface path
 
-- [x] H4. Add architecture docs
-  - current modular chess model
-  - future transferable reasoning architecture
+- [x] F3. Compare transcript-first, state-first, and hybrid training regimes
+  - shipped:
+    - `compare_surface_training_modes(...)`
+    - `scripts/compare_chess_surface_modes.jl`
+    - smoke-tested three-way comparison harness
+
+### EPIC G. Runtime Experiments
+
+- [x] G1. Run state-transition training on real PGN-derived data beyond toy tests
+  - shipped:
+    - real-PGN Hikaru archive runtime slice with `72` training games and `16` held-out games
+    - best state-first checkpoint: `tmp/state_first_runtime/checkpoints/state_first_checkpoint.jls`
+
+- [x] G2. Compare PGN-derived state training against the current transcript-token baseline
+  - shipped:
+    - matched runtime comparison between state-first and transcript-token baselines on the Hikaru-derived split
+    - state-first held-out loss is decisively lower on its evaluation surface than the transcript baseline is on the tokenized split
+
+- [x] G3. Re-run symbolic transfer experiments from a meaningful state-first checkpoint
+  - shipped:
+    - symbolic transfer rerun from the real-PGN state-first checkpoint
+    - fine-tuned transfer beat both scratch and frozen-core on the smoke comparison
 
 ---
 
@@ -253,28 +225,24 @@ Near-term chess version:
 
 ### P0
 
-- Completed foundational modular split and multi-head composition.
+- Completed.
 
 ### P1
 
-- Completed checker supervision, board-target extraction, transcript-derived auxiliary labels, and training entrypoints.
+- Completed.
 
 ### P2
 
-- Completed transition-consistency supervision, symbolic bridge tasks, core reuse, and transfer-comparison scaffolding.
+- Completed.
 
 ### P3
 
-- Solver-intent decision and longer-horizon transfer work after P2 is landed.
+- Move to larger-scale state-first experiments and next-phase architecture work tracked in `docs/plans/modular-refactor-next-steps.md`.
 
 ---
 
 ## Notes
 
-- The reusable asset is the `WavePDE` backbone, not the chess token shell.
-- The first modular target is not a full reasoning model. It is a modular chess model with:
-  - isolated input adapter
-  - isolated reusable core
-  - isolated proposer head
-  - newly added checker head
-- Later domain transfer should replace adapters and heads first, not the backbone.
+- The modular backlog that produced the reusable `WavePDECore`, adapters, heads, checker path, symbolic bridge tasks, and transfer harness is complete and no longer the active source of open work.
+- The active bottleneck is representational: transcript notation is still too surface-level for maximal abstraction capture.
+- The state-first PGN backlog is closed. Follow-on work now lives in `docs/plans/modular-refactor-next-steps.md` as the next-phase experimental plan rather than as open backlog debt.

@@ -3,7 +3,9 @@ module CheckerMetrics
 export checker_prediction_metrics,
     rerank_comparison_metrics,
     board_fact_metrics,
-    candidate_legality_metrics
+    candidate_legality_metrics,
+    board_probe_metrics,
+    state_slot_family_metrics
 
 function checker_prediction_metrics(predictions::AbstractArray{<:Real}, targets::AbstractArray{<:Real})
     size(predictions) == size(targets) || throw(ArgumentError(
@@ -169,6 +171,85 @@ function candidate_legality_metrics(
         brier_score=metrics.brier_score,
         predicted_legal_rate=metrics.predicted_positive_rate,
         target_legal_rate=metrics.target_positive_rate,
+    )
+end
+
+function board_probe_metrics(predictions::NamedTuple, targets::NamedTuple; threshold::Real=0.5)
+    required = (
+        :attacked_white,
+        :attacked_black,
+        :in_check,
+        :pinned_count,
+        :king_pressure,
+        :mobility,
+        :attacked_piece_count,
+    )
+    for field in required
+        haskey(predictions, field) || throw(ArgumentError("board_probe_metrics requires a $(field) prediction field."))
+        haskey(targets, field) || throw(ArgumentError("board_probe_metrics requires a $(field) target field."))
+    end
+
+    return (
+        attacked_white=board_fact_metrics(predictions.attacked_white, targets.attacked_white; threshold=threshold),
+        attacked_black=board_fact_metrics(predictions.attacked_black, targets.attacked_black; threshold=threshold),
+        in_check=board_fact_metrics(predictions.in_check, targets.in_check; threshold=threshold),
+        pinned_count=checker_prediction_metrics(predictions.pinned_count, targets.pinned_count),
+        king_pressure=checker_prediction_metrics(predictions.king_pressure, targets.king_pressure),
+        mobility=checker_prediction_metrics(predictions.mobility, targets.mobility),
+        attacked_piece_count=checker_prediction_metrics(predictions.attacked_piece_count, targets.attacked_piece_count),
+    )
+end
+
+function slot_family_metrics(
+    predictions::AbstractMatrix{<:Integer},
+    targets::AbstractMatrix{<:Integer},
+    slot_range::AbstractUnitRange{<:Integer},
+)
+    size(predictions) == size(targets) || throw(ArgumentError(
+        "slot_family_metrics expects predictions and targets with the same shape, got $(size(predictions)) and $(size(targets)).",
+    ))
+    first(slot_range) >= 1 || throw(ArgumentError("slot ranges must be 1-based."))
+    last(slot_range) <= size(predictions, 1) || throw(ArgumentError(
+        "slot range $(slot_range) exceeds the available token sequence length $(size(predictions, 1)).",
+    ))
+
+    num_examples = size(predictions, 2)
+    num_slots = length(slot_range)
+    num_examples > 0 || throw(ArgumentError("slot_family_metrics requires a non-empty batch."))
+    num_slots > 0 || throw(ArgumentError("slot_family_metrics requires a non-empty slot range."))
+
+    total_correct = 0
+    exact_matches = 0
+    for batch_idx in 1:num_examples
+        row_exact = true
+        for slot_idx in slot_range
+            correct = predictions[slot_idx, batch_idx] == targets[slot_idx, batch_idx]
+            total_correct += correct
+            row_exact &= correct
+        end
+        exact_matches += row_exact
+    end
+
+    total = Float64(num_slots * num_examples)
+    return (
+        token_accuracy=total_correct / total,
+        exact_match_rate=exact_matches / Float64(num_examples),
+        num_tokens=Int(total),
+        num_examples=num_examples,
+    )
+end
+
+function state_slot_family_metrics(predictions::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer})
+    size(predictions) == size(targets) || throw(ArgumentError(
+        "state_slot_family_metrics expects predictions and targets with the same shape, got $(size(predictions)) and $(size(targets)).",
+    ))
+    size(predictions, 1) >= 210 || throw(ArgumentError(
+        "state_slot_family_metrics expects at least 210 state slots, got $(size(predictions, 1)).",
+    ))
+    return (
+        coarse_state=slot_family_metrics(predictions, targets, 1:72),
+        attack_maps=slot_family_metrics(predictions, targets, 73:200),
+        pressure_counts=slot_family_metrics(predictions, targets, 201:210),
     )
 end
 
