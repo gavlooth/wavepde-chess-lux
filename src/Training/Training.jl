@@ -11,6 +11,11 @@ Base.@kwdef struct TrainingConfig
     log_interval::Int = 10
     min_tokens::Int = 8
     train_file_update_interval::Int = 10
+    checker_loss_weight::Float32 = 1.0f0
+    transition_loss_weight::Float32 = 0.0f0
+    transition_candidates_per_example::Int = 1
+    training_policy::Symbol = :full
+    board_target_mode::Symbol = :none
     checkpoint_path::String = joinpath(pwd(), "checkpoints", "wavepde_chess_checkpoint.jls")
     seed::Int = 1337
 end
@@ -21,8 +26,22 @@ mutable struct ChessParquetCorpus
     files::Vector{String}
     active_file::String
     active_games::Vector{Vector{Int32}}
+    active_checker_targets::Union{Nothing, Vector{Vector{Float32}}}
+    checker_target_dim::Int
     min_tokens::Int
+    board_target_mode::Symbol
 end
+
+const CHECKER_COLUMN_CANDIDATES = (
+    "checker_targets",
+    "checker_target",
+    "checker_labels",
+    "checker_score",
+)
+
+const TRAINING_POLICIES = (:full, :adapters_only, :heads_only)
+const BOARD_TARGET_MODES = (:none, :transcript_board_facts)
+const TRANSCRIPT_COLUMN_CANDIDATES = ("transcript",)
 
 function discover_parquet_files(data_dir::AbstractString)
     files = String[]
@@ -53,34 +72,210 @@ end
 
 sql_escape(path::AbstractString) = replace(path, "'" => "''")
 
-function load_tokenized_games(conn, path::AbstractString; min_tokens::Int=8)
-    assert_real_parquet(path)
-    rows = DBInterface.execute(conn, "SELECT tokenized FROM read_parquet('$(sql_escape(path))')")
-    games = Vector{Vector{Int32}}()
-    for row in rows
-        sequence = Int32[x for x in row[1] if !ismissing(x)]
-        length(sequence) >= min_tokens || continue
-        push!(games, sequence)
+function parquet_column_names(conn, path::AbstractString)
+    rows = DBInterface.execute(conn, "DESCRIBE SELECT * FROM read_parquet('$(sql_escape(path))')")
+    return String[row[1] for row in rows]
+end
+
+function find_checker_column(columns::AbstractVector{<:AbstractString})
+    for candidate in CHECKER_COLUMN_CANDIDATES
+        candidate in columns && return candidate
     end
+    return nothing
+end
+
+function find_transcript_column(columns::AbstractVector{<:AbstractString})
+    for candidate in TRANSCRIPT_COLUMN_CANDIDATES
+        candidate in columns && return candidate
+    end
+    return nothing
+end
+
+function parse_int_sequence(values)
+    return Int32[x for x in values if !ismissing(x)]
+end
+
+function parse_float_sequence(values)
+    return Float32[x for x in values if !ismissing(x)]
+end
+
+function validate_positive_count(name::AbstractString, value::Integer)
+    value > 0 || throw(ArgumentError("$(name) must be positive, got $(value)."))
+    return value
+end
+
+function validate_board_target_mode(mode::Symbol)
+    mode in BOARD_TARGET_MODES || throw(ArgumentError(
+        "Unsupported board_target_mode $(mode). Supported modes are $(BOARD_TARGET_MODES).",
+    ))
+    return mode
+end
+
+function load_transcript_board_examples(conn, path::AbstractString, transcript_column::AbstractString; min_tokens::Int=8)
+    rows = DBInterface.execute(
+        conn,
+        "SELECT $(transcript_column) AS transcript FROM read_parquet('$(sql_escape(path))')",
+    )
+    games = Vector{Vector{Int32}}()
+    checker_targets = Vector{Vector{Float32}}()
+    checker_target_dim = length(CHESS_BOARD_TARGET_NAMES)
+
+    for row in rows
+        transcript = row[1]
+        transcript === missing && continue
+        sequence = encode_chess_transcript(String(transcript))
+        length(sequence) >= min_tokens || continue
+        target = extract_board_targets_from_transcript(String(transcript))
+        length(target) == checker_target_dim || throw(ArgumentError(
+            "Transcript-derived checker target length mismatch in $(path): expected $(checker_target_dim), got $(length(target)).",
+        ))
+        push!(games, sequence)
+        push!(checker_targets, target)
+    end
+
+    isempty(games) && throw(ArgumentError(
+        "No usable transcript-derived games found in $(path).",
+    ))
+    return games, checker_targets, checker_target_dim
+end
+
+function build_transition_examples(
+    token_sequences::AbstractVector{<:AbstractVector{<:Integer}},
+    rng::AbstractRNG;
+    max_seq_len::Int,
+    candidates_per_example::Int=1,
+)
+    candidates_per_example = validate_positive_count("candidates_per_example", candidates_per_example)
+    max_seq_len = validate_positive_count("max_seq_len", max_seq_len)
+    transition_tokens = Vector{Vector{Int32}}()
+    transition_targets = Vector{Vector{Float32}}()
+    transition_target_dim = 0
+
+    for tokens in token_sequences
+        context_len = min(length(tokens), max_seq_len)
+        context_len >= max_seq_len && continue
+        context_tokens = view(tokens, 1:context_len)
+        transcript = decode_chess_tokens(context_tokens)
+        legal_moves = legal_san_candidates_from_transcript(transcript)
+        isempty(legal_moves) && continue
+
+        selected_candidates = if candidates_per_example >= length(legal_moves)
+            shuffle(rng, legal_moves)
+        else
+            legal_moves[randperm(rng, length(legal_moves))[1:candidates_per_example]]
+        end
+
+        transition = transition_board_targets(transcript, selected_candidates)
+        transition_target_dim == 0 && (transition_target_dim = size(transition.targets, 1))
+
+        for (candidate_idx, candidate) in enumerate(selected_candidates)
+            candidate_tokens = encode_chess_candidate_san(candidate)
+            context_len + length(candidate_tokens) > max_seq_len && continue
+            augmented_tokens = append_chess_candidate_san(context_tokens, candidate)
+            push!(transition_tokens, augmented_tokens)
+            push!(transition_targets, vec(transition.targets[:, candidate_idx]))
+        end
+    end
+
+    isempty(transition_tokens) && return nothing, nothing, 0
+    return transition_tokens, transition_targets, transition_target_dim
+end
+
+function load_training_examples(conn, path::AbstractString; min_tokens::Int=8, board_target_mode::Symbol=:none)
+    assert_real_parquet(path)
+    board_target_mode = validate_board_target_mode(board_target_mode)
+    columns = parquet_column_names(conn, path)
+    checker_column = find_checker_column(columns)
+    transcript_column = find_transcript_column(columns)
+
+    if board_target_mode == :transcript_board_facts
+        transcript_column === nothing && throw(ArgumentError(
+            "board_target_mode=:transcript_board_facts requires a transcript column in $(path).",
+        ))
+        return load_transcript_board_examples(conn, path, transcript_column; min_tokens=min_tokens)
+    end
+
+    if checker_column === nothing
+        rows = DBInterface.execute(conn, "SELECT tokenized FROM read_parquet('$(sql_escape(path))')")
+        games = Vector{Vector{Int32}}()
+        for row in rows
+            sequence = parse_int_sequence(row[1])
+            length(sequence) >= min_tokens || continue
+            push!(games, sequence)
+        end
+        return games, nothing, 0
+    end
+
+    rows = DBInterface.execute(
+        conn,
+        "SELECT tokenized, $(checker_column) AS checker_targets FROM read_parquet('$(sql_escape(path))')",
+    )
+    games = Vector{Vector{Int32}}()
+    checker_targets = Vector{Vector{Float32}}()
+    checker_target_dim = 0
+    for row in rows
+        sequence = parse_int_sequence(row[1])
+        length(sequence) >= min_tokens || continue
+        checker_values = row[2]
+        checker_values === missing && continue
+        target = parse_float_sequence(checker_values)
+        isempty(target) && continue
+        if checker_target_dim == 0
+            checker_target_dim = length(target)
+        else
+            length(target) == checker_target_dim || throw(ArgumentError(
+                "Checker target length mismatch in $(path): expected $(checker_target_dim), got $(length(target)).",
+            ))
+        end
+        push!(games, sequence)
+        push!(checker_targets, target)
+    end
+    isempty(games) && throw(ArgumentError("No usable tokenized games found in $(path)."))
+    return games, checker_targets, checker_target_dim
+end
+
+function load_tokenized_games(conn, path::AbstractString; min_tokens::Int=8, board_target_mode::Symbol=:none)
+    games, _, _ = load_training_examples(conn, path; min_tokens=min_tokens, board_target_mode=board_target_mode)
     return games
 end
 
-function ChessParquetCorpus(data_dir::AbstractString; min_tokens::Int=8)
+function ChessParquetCorpus(data_dir::AbstractString; min_tokens::Int=8, board_target_mode::Symbol=:none)
     files = discover_parquet_files(data_dir)
     isempty(files) && throw(ArgumentError("No parquet files found under $(data_dir)."))
 
     db = DuckDB.DB()
     conn = DBInterface.connect(db)
     active_file = first(files)
-    active_games = load_tokenized_games(conn, active_file; min_tokens=min_tokens)
+    board_target_mode = validate_board_target_mode(board_target_mode)
+    active_games, active_checker_targets, checker_target_dim = load_training_examples(
+        conn,
+        active_file;
+        min_tokens=min_tokens,
+        board_target_mode=board_target_mode,
+    )
     isempty(active_games) && throw(ArgumentError("No usable tokenized games found in $(active_file)."))
 
-    return ChessParquetCorpus(db, conn, files, active_file, active_games, min_tokens)
+    return ChessParquetCorpus(
+        db,
+        conn,
+        files,
+        active_file,
+        active_games,
+        active_checker_targets,
+        checker_target_dim,
+        min_tokens,
+        board_target_mode,
+    )
 end
 
 function reload_file!(corpus::ChessParquetCorpus, path::AbstractString)
     corpus.active_file = path
-    corpus.active_games = load_tokenized_games(corpus.conn, path; min_tokens=corpus.min_tokens)
+    corpus.active_games, corpus.active_checker_targets, corpus.checker_target_dim = load_training_examples(
+        corpus.conn,
+        path;
+        min_tokens=corpus.min_tokens,
+        board_target_mode=corpus.board_target_mode,
+    )
     isempty(corpus.active_games) && throw(ArgumentError("No usable tokenized games found in $(path)."))
     return corpus
 end
@@ -93,23 +288,75 @@ function maybe_rotate_file!(corpus::ChessParquetCorpus, rng::AbstractRNG, step::
     return corpus
 end
 
-function sample_batch(corpus::ChessParquetCorpus, rng::AbstractRNG; batch_size::Int, max_seq_len::Int)
+function sample_training_batch(
+    corpus::ChessParquetCorpus,
+    rng::AbstractRNG;
+    batch_size::Int,
+    max_seq_len::Int,
+    transition_candidates_per_example::Int=0,
+)
     sampled_games = Vector{Vector{Int32}}(undef, batch_size)
+    sampled_checker_targets = corpus.active_checker_targets === nothing ? nothing : Vector{Vector{Float32}}(undef, batch_size)
     max_batch_len = 0
 
     for i in 1:batch_size
-        game = corpus.active_games[rand(rng, eachindex(corpus.active_games))]
+        idx = rand(rng, eachindex(corpus.active_games))
+        game = corpus.active_games[idx]
         sampled_games[i] = game
+        sampled_checker_targets === nothing || (sampled_checker_targets[i] = corpus.active_checker_targets[idx])
         max_batch_len = max(max_batch_len, min(length(game), max_seq_len))
     end
 
-    sequences = zeros(Int32, max_batch_len, batch_size)
+    tokens = zeros(Int32, max_batch_len, batch_size)
     for (i, game) in enumerate(sampled_games)
         game_len = min(length(game), max_batch_len)
-        sequences[1:game_len, i] .= game[1:game_len]
+        tokens[1:game_len, i] .= game[1:game_len]
     end
 
-    return sequences
+    checker_targets = nothing
+    if sampled_checker_targets !== nothing
+        checker_targets = zeros(Float32, corpus.checker_target_dim, batch_size)
+        for i in 1:batch_size
+            target = sampled_checker_targets[i]
+            length(target) == corpus.checker_target_dim || throw(ArgumentError(
+                "Checker target length mismatch in sampled batch: expected $(corpus.checker_target_dim), got $(length(target)).",
+            ))
+            checker_targets[:, i] .= target
+        end
+    end
+
+    transition_tokens = nothing
+    transition_targets = nothing
+    if corpus.board_target_mode == :transcript_board_facts && transition_candidates_per_example > 0
+        transition_token_vectors, transition_target_vectors, transition_target_dim = build_transition_examples(
+            sampled_games,
+            rng;
+            max_seq_len=max_seq_len,
+            candidates_per_example=transition_candidates_per_example,
+        )
+        if transition_token_vectors !== nothing
+            max_transition_len = maximum(length.(transition_token_vectors))
+            transition_tokens = zeros(Int32, max_transition_len, length(transition_token_vectors))
+            for (i, sequence) in enumerate(transition_token_vectors)
+                transition_tokens[1:length(sequence), i] .= sequence
+            end
+            transition_targets = zeros(Float32, transition_target_dim, length(transition_target_vectors))
+            for (i, target) in enumerate(transition_target_vectors)
+                transition_targets[:, i] .= target
+            end
+        end
+    end
+
+    return (
+        tokens=tokens,
+        checker_targets=checker_targets,
+        transition_tokens=transition_tokens,
+        transition_targets=transition_targets,
+    )
+end
+
+function sample_batch(corpus::ChessParquetCorpus, rng::AbstractRNG; batch_size::Int, max_seq_len::Int)
+    return sample_training_batch(corpus, rng; batch_size=batch_size, max_seq_len=max_seq_len).tokens
 end
 
 function autoregressive_cross_entropy(logits::AbstractArray{T, 3}, targets::AbstractMatrix{<:Integer}) where {T<:AbstractFloat}
@@ -141,13 +388,140 @@ function extract_proposer_logits(output)
     return output
 end
 
-function autoregressive_loss(model, ps, st, batch::AbstractMatrix{<:Integer})
-    @assert size(batch, 1) >= 2 "Batch sequence length must be at least 2 for next-token prediction."
-    inputs = batch[1:(end - 1), :]
-    targets = batch[2:end, :]
+function extract_checker_scores(output)
+    if output isa NamedTuple && haskey(output, :checker)
+        return output.checker
+    end
+    return nothing
+end
+
+training_tokens(batch::AbstractMatrix{<:Integer}) = batch
+training_tokens(batch::NamedTuple) = batch.tokens
+
+training_checker_targets(::AbstractMatrix) = nothing
+training_checker_targets(batch::NamedTuple) = get(batch, :checker_targets, nothing)
+
+training_transition_tokens(::AbstractMatrix) = nothing
+training_transition_tokens(batch::NamedTuple) = get(batch, :transition_tokens, nothing)
+
+training_transition_targets(::AbstractMatrix) = nothing
+training_transition_targets(batch::NamedTuple) = get(batch, :transition_targets, nothing)
+
+function validate_training_policy(policy::Symbol)
+    policy in TRAINING_POLICIES || throw(ArgumentError(
+        "Unsupported training policy $(policy). Supported policies are $(TRAINING_POLICIES).",
+    ))
+    return policy
+end
+
+function trainable_parameter_groups(::ChessModel, policy::Symbol)
+    validate_training_policy(policy)
+    if policy == :full
+        return (:adapter, :core, :proposer)
+    elseif policy == :adapters_only
+        return (:adapter,)
+    else
+        return (:proposer,)
+    end
+end
+
+function trainable_parameter_groups(::ChessMultiHeadModel, policy::Symbol)
+    validate_training_policy(policy)
+    if policy == :full
+        return (:adapter, :core, :proposer, :checker)
+    elseif policy == :adapters_only
+        return (:adapter,)
+    else
+        return (:proposer, :checker)
+    end
+end
+
+function zero_like_tree(x::AbstractArray)
+    y = similar(x)
+    fill!(y, zero(eltype(x)))
+    return y
+end
+
+zero_like_tree(x::Number) = zero(x)
+zero_like_tree(x::Nothing) = nothing
+zero_like_tree(x::Tuple) = tuple((zero_like_tree(v) for v in x)...)
+
+function zero_like_tree(x::NamedTuple)
+    return NamedTuple{keys(x)}(tuple((zero_like_tree(v) for v in values(x))...))
+end
+
+zero_like_tree(x) = zero(x)
+
+function mask_frozen_parameter_groups(grads::NamedTuple, trainable_groups::Tuple{Vararg{Symbol}})
+    return (; (
+        group => (group in trainable_groups ? value : zero_like_tree(value))
+        for (group, value) in pairs(grads)
+    )...)
+end
+
+function apply_training_policy(model, grads, policy::Symbol)
+    return mask_frozen_parameter_groups(grads, trainable_parameter_groups(model, policy))
+end
+
+function next_token_prediction_loss(model, ps, st, batch_tokens::AbstractMatrix{<:Integer})
+    @assert size(batch_tokens, 1) >= 2 "Batch sequence length must be at least 2 for next-token prediction."
+    inputs = batch_tokens[1:(end - 1), :]
+    targets = batch_tokens[2:end, :]
     output, _ = Lux.apply(model, inputs, ps, st)
     logits = extract_proposer_logits(output)
-    return autoregressive_cross_entropy(logits, targets)
+    return autoregressive_cross_entropy(logits, targets), output
+end
+
+function checker_regression_loss(predictions::AbstractArray{T, 2}, targets::AbstractArray{<:Real, 2}) where {T<:AbstractFloat}
+    size(predictions) == size(targets) || throw(ArgumentError(
+        "Checker prediction and target shapes differ: got $(size(predictions)) vs $(size(targets)).",
+    ))
+
+    total = zero(T)
+    count = length(predictions)
+    for i in eachindex(predictions, targets)
+        diff = predictions[i] - T(targets[i])
+        total += diff * diff
+    end
+    return total / T(count)
+end
+
+function autoregressive_loss(model::ChessModel, ps, st, batch; checker_loss_weight::Real=1.0, transition_loss_weight::Real=0.0)
+    token_loss, _ = next_token_prediction_loss(model, ps, st, training_tokens(batch))
+    return token_loss
+end
+
+function autoregressive_loss(
+    model::ChessMultiHeadModel,
+    ps,
+    st,
+    batch;
+    checker_loss_weight::Real=1.0,
+    transition_loss_weight::Real=0.0,
+)
+    token_batch = training_tokens(batch)
+    token_loss, output = next_token_prediction_loss(model, ps, st, token_batch)
+    total_loss = token_loss
+
+    checker_targets = training_checker_targets(batch)
+    if checker_targets !== nothing
+        checker_scores = extract_checker_scores(output)
+        checker_scores === nothing && throw(ArgumentError("Multi-head model output must include :checker scores when checker supervision is provided."))
+        checker_loss = checker_regression_loss(checker_scores, checker_targets)
+        total_loss += Float32(checker_loss_weight) * checker_loss
+    end
+
+    transition_targets = training_transition_targets(batch)
+    transition_tokens = training_transition_tokens(batch)
+    if transition_loss_weight > 0 && transition_tokens !== nothing && transition_targets !== nothing
+        transition_outputs, _ = Lux.apply(model, transition_tokens, ps, st)
+        transition_scores = extract_checker_scores(transition_outputs)
+        transition_scores === nothing && throw(ArgumentError("Multi-head model output must include :checker scores when transition supervision is provided."))
+        transition_loss = checker_regression_loss(transition_scores, transition_targets)
+        total_loss += Float32(transition_loss_weight) * transition_loss
+    end
+
+    return total_loss
 end
 
 function save_checkpoint(path::AbstractString, payload)
@@ -160,6 +534,7 @@ end
 
 function train!(model, corpus::ChessParquetCorpus, cfg::TrainingConfig)
     rng = MersenneTwister(cfg.seed)
+    training_policy = validate_training_policy(cfg.training_policy)
     ps, st = Lux.setup(rng, model)
     optimizer = Optimisers.Adam(cfg.learning_rate)
     opt_state = Optimisers.setup(optimizer, ps)
@@ -167,15 +542,39 @@ function train!(model, corpus::ChessParquetCorpus, cfg::TrainingConfig)
 
     for step in 1:cfg.max_iters
         maybe_rotate_file!(corpus, rng, step; every=cfg.train_file_update_interval)
-        batch = sample_batch(corpus, rng; batch_size=cfg.batch_size, max_seq_len=model.config.max_seq_len)
+        batch = sample_training_batch(
+            corpus,
+            rng;
+            batch_size=cfg.batch_size,
+            max_seq_len=model.config.max_seq_len,
+            transition_candidates_per_example=cfg.transition_candidates_per_example,
+        )
 
-        loss = autoregressive_loss(model, ps, st, batch)
-        grads = Zygote.gradient(p -> autoregressive_loss(model, p, st, batch), ps)[1]
+        loss = autoregressive_loss(
+            model,
+            ps,
+            st,
+            batch;
+            checker_loss_weight=cfg.checker_loss_weight,
+            transition_loss_weight=cfg.transition_loss_weight,
+        )
+        grads = Zygote.gradient(
+            p -> autoregressive_loss(
+                model,
+                p,
+                st,
+                batch;
+                checker_loss_weight=cfg.checker_loss_weight,
+                transition_loss_weight=cfg.transition_loss_weight,
+            ),
+            ps,
+        )[1]
+        grads = apply_training_policy(model, grads, training_policy)
         opt_state, ps = Optimisers.update(opt_state, ps, grads)
 
         push!(losses, Float32(loss))
         if step % cfg.log_interval == 0 || step == 1 || step == cfg.max_iters
-            println("step=$(step) loss=$(round(loss; digits=4)) seq_len=$(size(batch, 1)) file=$(basename(corpus.active_file))")
+            println("step=$(step) loss=$(round(loss; digits=4)) seq_len=$(size(batch.tokens, 1)) file=$(basename(corpus.active_file))")
         end
     end
 

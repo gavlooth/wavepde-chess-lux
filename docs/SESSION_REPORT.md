@@ -10,23 +10,50 @@
 - code/config changes made
   - created a modular source layout under `src/Core/`, `src/Adapters/`, `src/Heads/`, `src/Models/`, and `src/Training/`
   - extracted `WavePDECore`, `ChessInputAdapter`, `ChessMoveHead`, `ChessCheckerHead`, `ChessModel`, and `ChessMultiHeadModel`
+  - added a generic `AbstractInputAdapter` / `input_adapter_output` interface while keeping the shipped `ChessInputAdapter` compatible with existing model construction
   - kept top-level compatibility via `src/WavePDEChess.jl`, `WavePDEConfig`, and `WavePDEChessLM`
   - added DuckDB-backed dataset loading and training utilities
-  - added/updated tests for modular composition and one-step training
+  - added optional checker supervision plumbing for parquet-backed training batches and composite multi-head loss
+  - added training freeze policies for `:full`, `:adapters_only`, and `:heads_only`
+  - added transcript-based chess target utilities backed by `python-chess`, including board-fact extraction, candidate legality labels, and transition target extraction
+  - added transcript-derived board-target loading through `ChessParquetCorpus(...; board_target_mode=:transcript_board_facts)`
+  - integrated transition-consistency supervision into transcript-derived checker training through appended candidate contexts and an auxiliary transition loss
+  - added checker prediction metrics, rerank-vs-proposer comparison metrics, board-fact metrics, and candidate-legality metrics
+  - added `scripts/train_chess_reasoning.jl` as the reasoning-oriented entrypoint over board-fact supervision
+  - added synthetic symbolic bridge-task generation plus `scripts/train_symbolic_bridge.jl`
+  - added a transfer-comparison harness plus `scripts/run_symbolic_transfer_comparison.jl` for scratch vs transplanted-core symbolic runs
+  - added/updated tests for transcript targets, transcript-derived checker supervision, modular composition, and one-step training
   - added root `AGENTS.md` and backlog/session-report guidance
 - experiment commands and key metrics
   - `julia --project=. test/runtests.jl`
+  - `julia --project=. -e 'include("scripts/train_chess_lm.jl"); include("scripts/train_chess_checker.jl"); include("scripts/train_chess_reasoning.jl"); include("scripts/train_chess_wavepde.jl"); include("scripts/train_symbolic_bridge.jl"); include("scripts/run_symbolic_transfer_comparison.jl"); println("script_load_ok")'`
   - final passing test metrics:
-    - `WavePDEChess`: 10/10 pass in about 4.1s
-    - `MultiHead Composition`: 2/2 pass in about 0.8s
-    - `DuckDB Training Path`: 6/6 pass in about 36.4s
-  - synthetic one-step training smoke run logged `step=1 loss=4.5047 seq_len=6 file=toy.parquet`
+    - `WavePDEChess`: 12/12 pass in about 2.5s
+    - `MultiHead Composition`: 2/2 pass in about 0.4s
+    - `MultiHead Reranking`: 5/5 pass in about 1.3s
+    - `Checker Metrics`: 18/18 pass in about 0.3s
+    - `Chess Transcript Targets`: 10/10 pass in about 0.4s
+    - `Transition Consistency Training`: 8/8 pass in about 30.2s
+    - `Symbolic Bridge Tasks`: 8/8 pass in about 2.7s
+    - `DuckDB Training Path`: 7/7 pass in about 0.3s
+    - `Transcript-Derived Checker Targets`: 7/7 pass in about 0.7s
+    - `Checker Supervision`: 6/6 pass in about 0.9s
+    - `Training Policy`: 13/13 pass in about 2.2s
+    - `Transfer Comparison`: 12/12 pass in about 1.0s
+  - script entrypoints loaded successfully via `script_load_ok`
+  - synthetic one-step training smoke runs logged:
+    - `step=1 loss=4.5047 seq_len=6 file=toy.parquet`
+    - `step=1 loss=4.358 seq_len=40 file=toy_transcript.parquet`
+    - `step=1 loss=6.0687 seq_len=6 file=toy_checker.parquet`
+    - `step=1 loss=5.1717 seq_len=41 file=toy_transition.parquet`
+    - `step=1 loss=4.0279 seq_len=23 file=symbolic_bridge.parquet`
 - best current checkpoint/config recommendation
   - current best code path is the modular `ChessModel` built from `chess_mamba_11m_config()`
   - use `scripts/train_chess_wavepde.jl` with real parquet data in `CHESS_DATA_DIR`
   - no meaningful trained checkpoint is recommended yet because only smoke-test and synthetic one-step runs were executed
 - unresolved issues and next actions
-  - the modular split covers the backlog P0 structure, but checker loss plumbing and checker-aware inference are still unimplemented
+  - the symbolic transfer harness is shipped, but it still needs empirical runs against a meaningful chess checkpoint
+  - the transition-consistency path currently shares the checker head and may need a dedicated probe if the supervision surface grows
   - the current solver uses the split-damping variant already present in the workspace and still needs an explicit paper-fidelity decision
   - the next concrete work items are recorded in `docs/plans/modular-refactor-next-steps.md`
 - Signature: Codex (GPT-5)

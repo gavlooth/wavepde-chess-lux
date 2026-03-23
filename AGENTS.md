@@ -18,10 +18,12 @@
 ## Mandatory Session Report Rule
 
 - Append a dated entry to `docs/SESSION_REPORT.md` only when the session produces meaningful reportable information. Avoid low-signal incremental updates that fragment the report.
+- Prefer updating the existing entry for the same date/session over appending a new same-day entry. Create multiple entries on one date only when there is a genuinely separate, decision-relevant milestone with new runtime results or conclusions.
 - Create a new dated entry when at least one of the following is true:
   1. Significant technical conclusions have been reached.
   2. An experiment has concluded with reportable results or decision-relevant metrics.
   3. The user explicitly directs the agent to end, wrap up, or record the session.
+- Do not create a report entry for routine environment setup, dependency installation, lightweight inspections, or documentation-only passes unless they materially changed the technical recommendation or produced a decision-relevant failure/surprise.
 - When an entry is warranted, include:
   - objectives attempted
   - code/config changes made

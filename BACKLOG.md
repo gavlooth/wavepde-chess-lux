@@ -63,12 +63,12 @@ Near-term chess version:
 
 ### EPIC A. Split Current Chess Model Into Modules
 
-- [ ] A1. Extract `ChessInputAdapter`
+- [x] A1. Extract `ChessInputAdapter`
   - current: `TokenEmbedding`
   - target: chess-specific input adapter module
   - result: surface encoding isolated from the reusable core
 
-- [ ] A2. Extract `WavePDECore`
+- [x] A2. Extract `WavePDECore`
   - current: `WavePDEChessLM` owns blocks directly
   - target: reusable module containing:
     - WavePDE block stack
@@ -76,12 +76,12 @@ Near-term chess version:
     - core config
   - result: backbone can be reused across domains
 
-- [ ] A3. Extract `ChessMoveHead`
+- [x] A3. Extract `ChessMoveHead`
   - current: tied logits are embedded in the main model
   - target: standalone proposer head
   - result: output projection becomes swappable
 
-- [ ] A4. Compose top-level chess model from modules
+- [x] A4. Compose top-level chess model from modules
   - target:
     - `ChessInputAdapter`
     - `WavePDECore`
@@ -90,129 +90,136 @@ Near-term chess version:
 
 ### EPIC B. Introduce Explicit Head Interfaces
 
-- [ ] B1. Add `AbstractProposerHead`-style interface
+- [x] B1. Add `AbstractProposerHead`-style interface
   - contract: hidden state -> logits or candidate scores
 
-- [ ] B2. Add `AbstractCheckerHead`-style interface
+- [x] B2. Add `AbstractCheckerHead`-style interface
   - contract: hidden state -> consistency outputs
   - first version can be a scalar or small predicate bundle
 
-- [ ] B3. Add a multi-head composition model
+- [x] B3. Add a multi-head composition model
   - target:
     - `ChessInputAdapter`
     - `WavePDECore`
     - `ChessMoveHead`
     - `ChessCheckerHead`
 
-- [ ] B4. Keep proposer and checker independent
+- [x] B4. Keep proposer and checker independent
   - reason: later domain transfer should replace heads without rewriting the core
 
 ### EPIC C. Make The Core Domain-Agnostic
 
-- [ ] C1. Rename chess-specific core assumptions
-  - avoid names that imply move-token semantics inside the backbone
+- [x] C1. Rename chess-specific core assumptions at the reusable boundary
+  - shipped:
+    - reusable `AbstractInputAdapter` / `input_adapter_output` contract
+    - adapter-facing error text and interface path no longer hardcode chess-only assumptions
 
-- [ ] C2. Define generic core tensor contract
+- [x] C2. Define generic core tensor contract
   - input: `(d_model, seq_len, batch)`
   - output: `(d_model, seq_len, batch)`
 
-- [ ] C3. Separate config types
+- [x] C3. Separate config types
   - `WavePDECoreConfig`
   - `ChessAdapterConfig`
   - `ChessHeadConfig`
 
-- [ ] C4. Remove vocab/output assumptions from the core
+- [x] C4. Remove vocab/output assumptions from the core
   - vocab belongs to adapters/heads, not the backbone
 
 ### EPIC D. Add Checker Infrastructure
 
-- [ ] D1. Add first `ChessCheckerHead`
-  - initial candidate outputs:
-    - legality proxy
-    - side-to-move proxy
-    - in-check proxy
-    - castling-rights proxy
-    - scalar consistency score
+- [x] D1. Add first `ChessCheckerHead`
+  - shipped: pooled checker head with scalar/vector score output
+  - remaining richer probe outputs belong in later checker/probe work
 
-- [ ] D2. Add checker loss plumbing
-  - total loss =
-    - proposer loss
-    - checker loss
-    - optional weighted auxiliary losses
+- [x] D2. Add checker loss plumbing
+  - shipped:
+    - proposer-only training still works for `ChessModel`
+    - `ChessMultiHeadModel` uses composite proposer + checker loss when checker targets are present
+    - parquet loader accepts optional checker supervision columns
 
-- [ ] D3. Add proposer + checker inference path
-  - proposer generates top-k candidates
-  - checker reranks or rescales them
+- [x] D3. Add proposer + checker inference path
+  - shipped:
+    - proposer generates top-k candidates
+    - checker reranks candidates on appended-token contexts through the existing checker head
 
-- [ ] D4. Add checker metrics
-  - legality accuracy
-  - calibration
-  - rerank win rate vs proposer-only baseline
+- [x] D4. Add checker metrics
+  - shipped:
+    - generic checker prediction error metrics
+    - rerank-vs-proposer comparison metrics
+    - board-fact classification metrics with accuracy, exact-match, and Brier score
+    - candidate-legality metrics for board-derived legality labels
 
 ### EPIC E. Add Latent-State Supervision
 
-- [ ] E1. Add board-derived target extraction
-  - targets:
-    - side to move
-    - in check
-    - castling rights
-    - legality for sampled candidates
-    - material bucket
-    - game phase
+- [x] E1. Add board-derived target extraction
+  - shipped:
+    - transcript normalization plus 28-token chess transcript encoding/decoding
+    - side to move, in-check, castling-rights, material-bucket, and game-phase targets
+    - legality labels for sampled SAN candidates
 
-- [ ] E2. Add probe heads
-  - hidden state -> board facts
+- [x] E2. Add probe heads
+  - shipped:
+    - vector-valued `ChessCheckerHead` now serves as the first board-fact probe bundle
 
-- [ ] E3. Add transition-consistency targets
-  - latent state at `t` + candidate move -> board facts at `t+1`
+- [x] E3. Integrate transition-consistency targets into training
+  - shipped:
+    - candidate-move transition target extraction for board facts at `t+1`
+    - appended-candidate transition contexts in training batches
+    - optional transition checker loss for transcript-derived training
 
-- [ ] E4. Extend dataset pipeline for auxiliary labels
+- [x] E4. Extend dataset pipeline for auxiliary labels
+  - shipped:
+    - `ChessParquetCorpus(...; board_target_mode=:transcript_board_facts)` derives tokenized transcripts and board-fact checker targets directly from parquet transcript columns
 
 ### EPIC F. Prepare For Domain Transfer
 
-- [ ] F1. Introduce `GenericInputAdapter` interface
+- [x] F1. Introduce `GenericInputAdapter` interface
   - later implementations:
     - `ChessInputAdapter`
     - `LogicInputAdapter`
     - `LanguageInputAdapter`
 
-- [ ] F2. Introduce `GenericProposerHead` interface
+- [x] F2. Introduce `GenericProposerHead` interface
   - later implementations:
     - `ChessMoveHead`
     - `LogicStepHead`
     - `ThoughtTokenHead`
 
-- [ ] F3. Introduce `GenericCheckerHead` interface
+- [x] F3. Introduce `GenericCheckerHead` interface
   - later implementations:
     - `ChessCheckerHead`
     - `LogicConsistencyHead`
     - `LanguageArgumentChecker`
 
-- [ ] F4. Add freeze/unfreeze policies
-  - train adapters only
-  - train heads only
-  - full fine-tune
+- [x] F4. Add freeze/unfreeze policies
+  - shipped:
+    - train adapters only
+    - train heads only
+    - full fine-tune
 
 ### EPIC G. Build Bridge Tasks Before Language
 
-- [ ] G1. Add synthetic symbolic tasks
-  - propositional logic
-  - entailment
-  - contradiction detection
-  - simple rule chaining
+- [x] G1. Add synthetic symbolic tasks
+  - shipped:
+    - propositional logic
+    - entailment
+    - contradiction detection
+    - simple rule chaining
 
-- [ ] G2. Reuse the same `WavePDECore` across those tasks
-  - swap only adapters and heads
+- [x] G2. Reuse the same `WavePDECore` across those tasks
+  - shipped:
+    - symbolic bridge training path reuses the existing modular model stack and `WavePDECore`
 
-- [ ] G3. Compare transfer settings
-  - from scratch
-  - chess-core init
-  - chess-core frozen
-  - chess-core fine-tuned
+- [x] G3. Compare transfer settings
+  - shipped:
+    - scratch full training
+    - chess-core init with frozen core
+    - chess-core init with fine-tuning
 
 ### EPIC H. Repository Restructure
 
-- [ ] H1. Split file layout
+- [x] H1. Split file layout
   - target:
     - `src/Core/`
     - `src/Adapters/`
@@ -220,7 +227,7 @@ Near-term chess version:
     - `src/Models/`
     - `src/Training/`
 
-- [ ] H2. Move current monolith into modules
+- [x] H2. Move current monolith into modules
   - current:
     - `src/WavePDEChess.jl`
   - target:
@@ -229,12 +236,14 @@ Near-term chess version:
     - `src/Heads/ChessMoveHead.jl`
     - `src/Models/ChessModel.jl`
 
-- [ ] H3. Add task-specific entrypoints
-  - `scripts/train_chess_lm.jl`
-  - `scripts/train_chess_checker.jl`
-  - `scripts/train_chess_reasoning.jl`
+- [x] H3. Add task-specific entrypoints
+  - shipped: `scripts/train_chess_lm.jl`
+  - shipped: `scripts/train_chess_checker.jl`
 
-- [ ] H4. Add architecture docs
+- [x] H5. Add reasoning-oriented training entrypoint
+  - shipped: `scripts/train_chess_reasoning.jl`
+
+- [x] H4. Add architecture docs
   - current modular chess model
   - future transferable reasoning architecture
 
@@ -244,41 +253,19 @@ Near-term chess version:
 
 ### P0
 
-- [ ] A1. Extract `ChessInputAdapter`
-- [ ] A2. Extract `WavePDECore`
-- [ ] A3. Extract `ChessMoveHead`
-- [ ] A4. Compose modular chess model
-- [ ] B1. Add proposer head interface
-- [ ] B2. Add checker head interface
-- [ ] B3. Add multi-head composition model
-- [ ] H1. Split file layout
-- [ ] H2. Move current monolith into modules
+- Completed foundational modular split and multi-head composition.
 
 ### P1
 
-- [ ] D1. Add first `ChessCheckerHead`
-- [ ] D2. Add checker loss plumbing
-- [ ] E1. Add board-derived target extraction
-- [ ] E2. Add probe heads
-- [ ] H3. Add training entrypoints
+- Completed checker supervision, board-target extraction, transcript-derived auxiliary labels, and training entrypoints.
 
 ### P2
 
-- [ ] D3. Add proposer + checker inference path
-- [ ] D4. Add checker metrics
-- [ ] E3. Add transition-consistency targets
-- [ ] E4. Extend dataset pipeline
-- [ ] F1. Add generic input adapter interface
-- [ ] F2. Add generic proposer head interface
-- [ ] F3. Add generic checker head interface
+- Completed transition-consistency supervision, symbolic bridge tasks, core reuse, and transfer-comparison scaffolding.
 
 ### P3
 
-- [ ] F4. Add freeze/unfreeze policies
-- [ ] G1. Add symbolic bridge tasks
-- [ ] G2. Reuse same `WavePDECore` on bridge tasks
-- [ ] G3. Run transfer comparisons
-- [ ] H4. Add architecture docs
+- Solver-intent decision and longer-horizon transfer work after P2 is landed.
 
 ---
 

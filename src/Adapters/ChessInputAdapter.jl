@@ -4,7 +4,7 @@ Base.@kwdef struct ChessAdapterConfig
     pad_token::Int = 0
 end
 
-struct ChessInputAdapter <: Lux.AbstractLuxLayer
+struct ChessInputAdapter <: AbstractInputAdapter
     config::ChessAdapterConfig
 end
 
@@ -16,9 +16,9 @@ end
 
 Lux.initialstates(::AbstractRNG, ::ChessInputAdapter) = NamedTuple()
 
-function (adapter::ChessInputAdapter)(tokens::AbstractArray{<:Integer}, ps, st)
+function input_adapter_output(adapter::ChessInputAdapter, tokens::AbstractArray{<:Integer}, ps, st)
     ndims(tokens) == 2 || throw(ArgumentError(
-        "ChessInputAdapter expects tokens with shape (seq_len, batch), got $(size(tokens)).",
+        "Input adapter expects tokens with shape (seq_len, batch), got $(size(tokens)).",
     ))
     if any(tokens .< 0) || any(tokens .>= adapter.config.vocab_size)
         throw(ArgumentError("Token ids must be in [0, $(adapter.config.vocab_size - 1)]."))

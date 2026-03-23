@@ -43,6 +43,115 @@ Near-term chess model:
 +------------------+   +------------------+
 ```
 
+Current `wavepde-chess-lux` stack in plain ASCII:
+
+```text
+[chess tokens / move sequence]
+              |
+              v
++---------------------------+
+| ChessInputAdapter         |
+| - token embedding         |
++---------------------------+
+              |
+              v
++---------------------------+
+| WavePDECore               |
+| - RMSNorm                 |
+| - WavePDEBlock x N        |
+| - spectral mixer          |
+| - residual updates        |
++---------------------------+
+        |                           |
+        |                           |
+        v                           v
++-------------------+     +-------------------+
+| ChessMoveHead     |     | ChessCheckerHead  |
+| - proposer logits |     | - pooled score    |
++-------------------+     +-------------------+
+```
+
+Proposed enriched version with a relational abstraction layer:
+
+```text
+[chess input]
+     |
+     v
++------------------+
+| Input Adapter    |
++------------------+
+     |
+     v
++------------------+
+| WavePDECore      |
++------------------+
+     |
+     v
++------------------+
+| Predicate Layer  |
+| - role binding   |
+| - typed relations|
++------------------+
+     |
+     +-------------------+-------------------+
+     |                   |                   |
+     v                   v                   v
++-----------+     +-------------+     +-------------+
+| Move Head |     | Checker     |     | Probe Heads |
+|           |     | Head        |     | legality    |
+|           |     |             |     | in-check    |
+|           |     |             |     | castling    |
++-----------+     +-------------+     +-------------+
+```
+
+Longer-term transfer-oriented version:
+
+```text
+[chess-specific input]
+          |
+          v
++---------------------------+
+| Chess Pre-Front           |
+| disposable later          |
++---------------------------+
+          |
+          v
++---------------------------+
+| Mid-Front                 |
+| primitive relational      |
+| fields                    |
++---------------------------+
+          |
+          v
++---------------------------+
+| Bridge                    |
+| typed entities/relations  |
+| preserve later            |
++---------------------------+
+          |
+          v
++---------------------------+
+| WavePDECore               |
+| dynamic propagation       |
++---------------------------+
+          |
+          v
++---------------------------+
+| Predicate Layer           |
+| typed relation logic      |
++---------------------------+
+          |
+          v
++---------------------------+
+| Abstraction Composer      |
++---------------------------+
+          |
+          v
++---------------------------+
+| Domain heads / probes     |
++---------------------------+
+```
+
 ## Relation To The Paper
 
 Paper-faithful choices:

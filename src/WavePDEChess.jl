@@ -26,6 +26,7 @@ using DuckDB
 using FFTW
 using Lux
 using Optimisers
+using PyCall
 using Random
 using Serialization
 using Statistics: mean
@@ -38,6 +39,7 @@ export WavePDECoreConfig,
     ChessModelConfig,
     ChessMultiHeadModelConfig,
     WavePDECore,
+    AbstractInputAdapter,
     ChessInputAdapter,
     AbstractProposerHead,
     AbstractCheckerHead,
@@ -51,6 +53,24 @@ export WavePDECoreConfig,
     ChessParquetCorpus,
     chess_mamba_11m_config,
     autoregressive_cross_entropy,
+    CHESS_BOARD_TARGET_NAMES,
+    board_fact_metrics,
+    candidate_legality_targets,
+    candidate_legality_metrics,
+    checker_prediction_metrics,
+    legal_san_candidates_from_transcript,
+    decode_chess_tokens,
+    encode_chess_candidate_san,
+    encode_chess_transcript,
+    append_chess_candidate_san,
+    extract_board_targets_from_tokens,
+    extract_board_targets_from_transcript,
+    rerank_comparison_metrics,
+    checker_scalarize,
+    input_adapter_output,
+    transition_board_targets,
+    proposer_topk,
+    rerank_next_token_candidates,
     proposer_output,
     checker_output,
     parameter_count,
@@ -58,13 +78,20 @@ export WavePDECoreConfig,
     train!
 
 include("Core/WavePDECore.jl")
-include("Adapters/ChessInputAdapter.jl")
 include("Heads/Interfaces.jl")
+include("Adapters/ChessInputAdapter.jl")
 include("Heads/ChessMoveHead.jl")
 include("Heads/ChessCheckerHead.jl")
 include("Models/ChessModel.jl")
 include("Models/ChessMultiHeadModel.jl")
+include("Training/ChessTargets.jl")
 include("Training/Training.jl")
+include("Training/CheckerMetrics.jl")
+using .CheckerMetrics:
+    board_fact_metrics,
+    candidate_legality_metrics,
+    checker_prediction_metrics,
+    rerank_comparison_metrics
 
 Base.@kwdef struct WavePDEConfig
     vocab_size::Int = 28
