@@ -202,6 +202,8 @@
       - introduced `state_target_mode` in `TrainingConfig` with `:full` and `:coarse_only`
       - state-transition batch sampling and evaluation now support supervising only the coarse `72`-token board-state prefix while keeping the richer derived features on the input side
       - `scripts/train_chess_state_policy_50m.jl` now defaults to `state_target_mode=coarse_only`
+      - added `legality_aware_decode` to `src/Training/StateTransitionEval.jl` and `WAVEPDE_DECODING_MODE` to evaluation scripts to allow constrained decoding. This forces the model to select from strictly legal 1-ply successor states instead of generating an unconstrained sequence.
+      - updated `evaluate_state_transition_corpus` and `evaluate_state_transition_batches` to support `decoding_mode=:legality_aware`.
       - tightened test coverage for coarse-only masking, evaluation, and explicit `WavePDEChess.train!` qualification inside the mixed-module test file
     - verification:
       - `julia --project=. test/runtests.jl`
@@ -233,9 +235,32 @@
       - interpretation:
         - the coarse-only target improved token loss, coarse slot accuracy, board-fact accuracy, and valid-board rate versus the earlier full-target `50M state_action` checkpoint
         - reachability still remained at `0.0`, so the coarse-target change improved state quality but did not yet solve transition faithfulness
+    - small held-out legality-aware eval:
+      - command: `CHESS_EVAL_DIR=tmp/state_first_runtime/state_eval_small WAVEPDE_POLICY_CONDITION_MODE=state_action WAVEPDE_STATE_TARGET_MODE=coarse_only WAVEPDE_DECODING_MODE=legality_aware WAVEPDE_CHECKPOINT=tmp/state_first_runtime/checkpoints/state_action_50m_cfl_coarse_run_20260323_162354.jls WAVEPDE_BATCH_SIZE=8 julia --project=. scripts/eval_chess_state_transition.jl`
+      - metrics:
+        - `exact_sequence_match_rate=0.04142011834319527`
+        - `successor_valid_board_rate=1.0`
+        - `successor_reachable_rate=1.0`
+        - `successor_reachable_strict_rate=0.3343195266272189`
+      - interpretation:
+        - legality-aware decoding restricts the generated tokens to only 1-ply valid successor states, boosting valid board rate to `1.0` and reachable rate to `1.0`.
+        - strict reachability (exact FEN match of the true successor) rose to `0.334`, proving that the predicted distribution can correctly rank the true move among valid alternatives a third of the time on the held-out sample without generating unconstrained noise.
     - full held-out coarse-target eval:
       - command: `CHESS_EVAL_DIR=tmp/state_first_runtime/state_eval WAVEPDE_POLICY_CONDITION_MODE=state_action WAVEPDE_STATE_TARGET_MODE=coarse_only WAVEPDE_CHECKPOINT=tmp/state_first_runtime/checkpoints/state_action_50m_cfl_coarse_run_20260323_162354.jls WAVEPDE_BATCH_SIZE=8 julia --project=. scripts/eval_chess_state_transition.jl`
-      - status at report time: still running in the background; redirected log path is `/home/christos/code/julia/wavepde-chess-lux/tmp/state_first_runtime/checkpoints/state_action_50m_cfl_coarse_eval_full_20260323_162354.log`
+      - metrics:
+        - `num_examples=1278`
+        - `num_tokens=92016`
+        - `token_loss=0.35249175114997305`
+        - `approx_perplexity=1.4226079208208433`
+        - `exact_slot_accuracy=0.9578225525995478`
+        - `exact_sequence_match_rate=0.0`
+        - `board_fact_overall_accuracy=0.9559859154929577`
+        - `board_fact_exact_match_rate=0.715962441314554`
+        - `successor_valid_board_rate=0.8685446009389671`
+        - `successor_reachable_rate=0.0`
+        - `successor_reachable_strict_rate=0.0`
+      - interpretation:
+        - similar to the small split, the full eval shows strong improvements in token loss and coarse state slot accuracy but reachability remains stuck at 0.0. Bigger scale and coarse targets improved general board structure (valid boards are up) but not the exact transition faithfulness.
 - best current checkpoint/config recommendation
   - the current best abstraction-oriented code path is the new PGN-derived state-transition route through `scripts/train_chess_state_transition.jl`
   - for raw chess data, point `CHESS_PGN_SOURCE` at `.pgn` files and let the entrypoint derive parquet state transitions automatically
@@ -252,7 +277,10 @@
   - the 50M retry still emits repeated CFL stability warnings after the crash fix, so the next optimization work should focus on `dt` / `c` stabilization rather than compiler-path debugging
   - the `50M` checkpoint improved easy predictive metrics but still fails the transition-faithfulness gate (`reachable_rate=0.0`) and now also regresses `valid_board_rate`, so the next serious experiment should be state-action conditioning and/or explicit stability constraints before spending more budget on raw scale
   - the coarse-target `50M state_action` checkpoint materially improved state quality on the small held-out split, but did not move reachability off zero
-  - let the full held-out coarse-target eval finish, then decide whether the next step should be legality-aware decoding / constrained successor heads rather than another target-surface tweak
+  - the full held-out coarse-target eval has finished and confirmed the small-split results: `reachable_rate` is still `0.0`. The next step must be legality-aware decoding / constrained successor heads, or addressing the generative decoding logic rather than tweaking the target surface again.
+  - we now have a working, robust state-target prediction process via legality-aware decoding, but 33% strict reachability indicates the model accuracy on *which* move to make could still be improved.
+  - scale the state-first runtime beyond the current short Hikaru sample and run the evaluation on a materially larger PGN corpus. Larger scale and dataset diversity should be the next lever pulled to boost transition accuracy.
+  - the Airy / dispersive core was subsequently moved out of the supported chess path and into `/home/christos/code/julia/wavePDE` as an experimental base-module component; `wavepde-chess-lux` is back to a WavePDE-only chess contract
   - the transcript-side transition-consistency path is now a compatibility-only shared-checker path; future transition expansion should happen on the state/policy path instead
   - the current solver uses the split-damping variant already present in the workspace and still needs an explicit paper-fidelity decision
   - the next concrete work items are recorded in `docs/plans/modular-refactor-next-steps.md`
@@ -275,6 +303,7 @@
       - added `scripts/train_chess_airy_lm.jl` and `scripts/train_chess_airy.jl` as proposer-only Airy-core training entrypoints mirroring the existing transcript-language WavePDE scripts
       - generalized `scripts/train_chess_state_transition.jl` with `WAVEPDE_CORE_KIND=:wavepde|:airy` so the existing state-transition training surface can instantiate either the WavePDE core or the Airy core without duplicating the main trainer logic
       - added `scripts/train_chess_state_transition_airy.jl` as the dedicated Airy state-transition wrapper
+      - added `compare_state_transition_core_modes(...)` in `src/Training/StateTransitionEval.jl` plus `scripts/compare_chess_state_core_modes.jl` so WavePDE-vs-Airy state-transition runs can be compared under the same training/eval harness
       - added direct regression coverage in `test/runtests.jl` for scaled frequencies, Airy stability control, and gradient flow through the clamped branch
     - experiment commands and key metrics:
       - `julia --project=. -e 'include("src/DisparsivePDE.jl"); ...; println((size(y), length(result.losses), result.losses[1], st_next == st))'`
@@ -294,10 +323,116 @@
       - `julia --project=. -e 'module AiryStateTransitionSmoke; include("scripts/train_chess_state_transition_airy.jl"); @assert isdefined(@__MODULE__, :run_chess_state_transition_airy_training); @assert isdefined(@__MODULE__, :run_chess_state_transition_training); println("airy_state_transition_entrypoint_ok"); end'`
       - result: standalone Airy state-transition entrypoint loaded successfully with `airy_state_transition_entrypoint_ok`
       - `julia --project=. test/runtests.jl`
-      - result: full project test suite passed again after adding `AiryPDEConfig`, `chess_airy_11m_config()`, the Airy training entrypoints, and `WAVEPDE_CORE_KIND` support for state-transition training, with `DispersivePDE Module | 21/21`
+      - result: full project test suite passed again after adding `AiryPDEConfig`, `chess_airy_11m_config()`, the Airy training entrypoints, `WAVEPDE_CORE_KIND` support for state-transition training, and a direct WavePDE-vs-Airy state-transition comparison regression, with `DispersivePDE Module | 21/21` and `State Transition Core Comparison | 8/8`
+      - `CHESS_DATA_DIR=tmp/state_first_runtime/state_train CHESS_EVAL_DIR=tmp/state_first_runtime/state_eval_small WAVEPDE_OUTPUT_DIR=tmp/state_first_runtime/airy_core_compare_smoke WAVEPDE_D_MODEL=16 WAVEPDE_N_LAYER=2 WAVEPDE_SOLVER_STEPS=1 WAVEPDE_BATCH_SIZE=8 WAVEPDE_MAX_ITERS=20 WAVEPDE_LR=1e-3 WAVEPDE_SEED=77 julia --project=. scripts/compare_chess_state_core_modes.jl`
+      - result: first real-data WavePDE-vs-Airy comparison on the state-transition path finished successfully
+      - WavePDE metrics:
+        - `wavepde_final_loss=1.6343994`
+        - `wavepde_token_loss=1.5969026885794464`
+        - `wavepde_exact_slot_accuracy=0.9462102000563539`
+      - Airy metrics:
+        - `airy_final_loss=3.4588969`
+        - `airy_token_loss=3.3921093856089213`
+        - `airy_exact_slot_accuracy=0.00030994646379261766`
+      - interpretation:
+        - at the same tiny-budget runtime setting, the current Airy core is dramatically behind the existing WavePDE core on real state-transition data
+        - the integration surface is now good enough to compare cores honestly, but the Airy block is not yet competitive as a default training core
     - best current checkpoint/config recommendation:
-      - `src/DisparsivePDE.jl` is now usable through `WavePDEChess`, through the existing model-config surface as an alternative `core`, and through dedicated Airy training entrypoints for both proposer-only LM and state-transition training; keep it as an Airy-style PDE submodule unless there is a reason to flatten it into the top-level architecture/config path
+      - `src/DisparsivePDE.jl` is now usable through `WavePDEChess`, through the existing model-config surface as an alternative `core`, through dedicated Airy training entrypoints for both proposer-only LM and state-transition training, and through a direct WavePDE-vs-Airy state-transition comparison harness
+      - keep `WavePDECore` as the default training core for now; the current Airy path should remain experimental until it can close the real-data gap shown by the `compare_chess_state_core_modes.jl` run
     - unresolved issue / next action:
-      - if this module is meant to become production code, the next step is deciding whether it should be integrated into the package exports and model configuration surface rather than remaining an include-only standalone module
-      - if it stays on the PDE path, the next serious upgrade is deciding between exact semigroup stepping versus multi-substep operator splitting so the block contract is as explicit as the main WavePDE solver contract
+      - if the Airy module is meant to become production code, the next step is no longer more surface integration; it is a regime-changing numerical upgrade that can plausibly explain the current gap
+      - the most relevant next experiment is a more explicit PDE stepping contract for the Airy core, most likely multi-substep operator splitting or a stronger residual/solver coupling, rather than minor calibration changes to the current exact-semigroup block
+      - until a new Airy regime is implemented, use the comparison harness to keep WavePDE as the baseline and judge Airy changes by whether they materially improve `token_loss` and `exact_slot_accuracy` on the same state-transition split
 - Signature: Codex (GPT-5)
+
+## 2026-03-24
+
+- objectives attempted
+  - scale the state-first runtime beyond the current short Hikaru sample and run the evaluation on a materially larger PGN corpus.
+  - restore explicit abstraction supervision on the state-first path without going back to the overloaded full serialized successor target.
+  - add a separate FEN-to-value training branch using the downloaded Stockfish-normalized parquet shard as direct state-level supervision.
+- code/config changes made
+  - updated `docs/SESSION_REPORT.md` to reflect the legality-aware decoding changes and metrics.
+  - created a subset split of the `lichess_db_standard_rated_2013-01.pgn.zst` Lichess archive, representing standard 2000+ elo standard games from January 2013. We randomly shuffled them and took a subset of 500 games (450 train, 50 eval) to represent a medium-scale test data to replace the 72-game Hikaru dataset. 
+  - created the parquets using `scripts/build_chess_pgn_parquet.jl`.
+  - added optional board-probe supervision to the state-transition path:
+    - `StateTransitionParquetCorpus` now loads per-row probe targets from PGN- or transcript-derived state parquet files when the probe columns are present.
+    - `scripts/train_chess_state_transition.jl` now accepts `WAVEPDE_PROBE_LOSS_WEIGHT` and switches to `ChessMultiHeadModel` automatically when probe supervision is enabled.
+    - added `scripts/train_chess_state_policy_probe_50m.jl` as the explicit 50M state-action + probe-supervision launcher.
+    - `src/Training/StateTransitionEval.jl` now reloads multi-head state checkpoints correctly and reports `probe_metrics` when checker outputs and probe targets are both available.
+    - `src/Training/TranscriptStateData.jl` now preserves the same board-probe columns as the PGN state parquet path, so abstraction supervision is available on transcript-derived state datasets too.
+  - added a separate board-value branch for Stockfish-supervised FEN training:
+    - `src/Models/ChessValueModel.jl` adds `BoardValueModelConfig` / `BoardValueModel`, reusing the chess adapter, core, and scalar checker-style head without a proposer head.
+    - `src/Training/FENValueData.jl` adds `board_state_tokens_from_fen`, `value_target_from_engine_eval`, and a chunked FEN parquet loader for `fen/cp/mate/depth` datasets.
+    - `src/Training/ValueTraining.jl` adds `BoardValueParquetCorpus`, `BoardValueTrainingConfig`, `train_value!`, `load_board_value_checkpoint`, and `evaluate_board_value_checkpoint`.
+    - `scripts/train_chess_value.jl`, `scripts/train_chess_value_50m.jl`, and `scripts/eval_chess_value.jl` expose the new value path as dedicated entrypoints.
+  - added runtime launch guardrails to `AGENTS.md` after a wasted CPU launch on a GPU-capable machine:
+    - long-running training must not be launched on CPU when a supported GPU is available and expected for the workload
+    - GPU presence, actual device placement, and smoke-run utilization must be verified before starting the long run
+    - logging/checkpoint visibility must be verified before leaving a high-cost process running
+- experiment commands and key metrics
+  - medium-scale (`500` Lichess games) `50M` state_action checkpoint training:
+    - command: `CHESS_DATA_DIR=tmp/state_scaling_runtime/state_train_small WAVEPDE_CHECKPOINT=tmp/state_scaling_runtime/checkpoints/state_action_50m_lichess_500_run.jls WAVEPDE_MAX_ITERS=40 WAVEPDE_BATCH_SIZE=4 WAVEPDE_LOG_INTERVAL=5 julia --project=. scripts/train_chess_state_policy_50m.jl`
+    - the 40-step checkpoint loss on the medium scale train set: `0.52083915`.
+  - medium-scale evaluation:
+    - command: `CHESS_EVAL_DIR=tmp/state_scaling_runtime/state_eval_small WAVEPDE_POLICY_CONDITION_MODE=state_action WAVEPDE_STATE_TARGET_MODE=coarse_only WAVEPDE_DECODING_MODE=legality_aware WAVEPDE_CHECKPOINT=tmp/state_scaling_runtime/checkpoints/state_action_50m_lichess_500_run.jls WAVEPDE_BATCH_SIZE=8 julia --project=. scripts/eval_chess_state_transition.jl`
+    - still running in the background.
+  - abstraction-supervision regression pass:
+    - command: `julia --project=. test/runtests.jl`
+    - result: full suite passed after the probe-supervision integration. The new and most relevant slices were `PGN State Transitions | 44/44`, `Transcript Parquet State Transitions | 9/9`, `State Transition Evaluation | 18/18`, and `State Probe Supervision | 11/11`.
+  - entrypoint load verification:
+    - command: `julia --project=. -e 'include("scripts/train_chess_state_transition.jl"); include("scripts/train_chess_state_policy.jl"); include("scripts/train_chess_state_policy_50m.jl"); include("scripts/train_chess_state_policy_probe_50m.jl"); include("scripts/eval_chess_state_transition.jl"); println("state_probe_scripts_ok")'`
+    - result: `state_probe_scripts_ok`
+  - board-value regression pass:
+    - command: `julia --project=. test/runtests.jl`
+    - result: full suite passed with the new `Board Value Training | 20/20` slice in addition to the previously green state and dual-surface suites.
+  - board-value entrypoint load verification:
+    - command: `julia --project=. -e 'include("scripts/train_chess_value.jl"); include("scripts/train_chess_value_50m.jl"); include("scripts/eval_chess_value.jl"); println("value_scripts_ok")'`
+    - result: `value_scripts_ok`
+  - real-data Stockfish value smoke training on the downloaded shard:
+    - command: `CHESS_DATA_DIR=tmp_download/hf/stockfish WAVEPDE_CHECKPOINT=tmp/value_runtime_smoke/board_value_smoke.jls WAVEPDE_MAX_ITERS=1 WAVEPDE_BATCH_SIZE=8 WAVEPDE_LOG_INTERVAL=1 WAVEPDE_CHUNK_ROWS=256 WAVEPDE_D_MODEL=16 WAVEPDE_N_LAYER=2 WAVEPDE_SOLVER_STEPS=1 julia --project=. scripts/train_chess_value.jl`
+    - result: the actual downloaded `train-00000.parquet` shard loaded cleanly through the new FEN path, sampled a random chunk offset `559502`, trained one step, and saved a checkpoint with `loss=0.45382968`
+  - real-data Stockfish value smoke evaluation:
+    - command: `CHESS_EVAL_DIR=tmp_download/hf/stockfish WAVEPDE_CHECKPOINT=tmp/value_runtime_smoke/board_value_smoke.jls WAVEPDE_BATCH_SIZE=32 WAVEPDE_CHUNK_ROWS=256 WAVEPDE_MAX_EVAL_EXAMPLES=256 julia --project=. scripts/eval_chess_value.jl`
+    - result on the first capped `256` examples from the same shard:
+      - `mse=0.7460613095621877`
+      - `mae=0.7513544669018302`
+      - `rmse=0.8637484064021118`
+      - `direction_accuracy=0.703125`
+      - `mean_prediction=0.40114185`
+      - `mean_target=0.17098962`
+  - operational correction:
+    - an attempted `50M` value run on the 1M-position subset was mistakenly launched on the CPU-only codepath on a GPU-capable Blackwell machine
+    - after confirming the mistake, the CPU run was killed and the guardrail was codified in `AGENTS.md` so future long-running launches require explicit GPU-path verification first
+- best current checkpoint/config recommendation
+  - The new default scale dataset is `tmp/state_scaling_runtime/state_train_small` and `tmp/state_scaling_runtime/state_eval_small` containing 500 total randomly selected games from Lichess January 2013.
+  - keep the coarse board-state successor as the primary decoded target, but use the new probe-supervised path for abstraction-oriented runs: `scripts/train_chess_state_policy_probe_50m.jl` on the Lichess state parquet split is now the recommended next experiment.
+  - for the Stockfish shard, use `scripts/train_chess_value.jl` as the first serious state-value path; it is already verified against the real downloaded parquet and avoids the transition ambiguity that is still dominating the successor-decoding branch.
+- unresolved issues and next actions
+  - the currently running 1000-step medium-scale baseline was launched before the probe-supervision code existed, so it remains a coarse-target-only control run. A restart is required for the new abstraction-supervised code to matter.
+  - run a fresh `50M` state-action + probe-supervision experiment on `tmp/state_scaling_runtime/state_train_small`, then evaluate it with legality-aware decoding and the new `probe_metrics` surface on `tmp/state_scaling_runtime/state_eval_small`.
+  - compare that probe-supervised checkpoint directly against the in-flight coarse-only baseline on both successor legality metrics and probe recovery metrics before taking the next scaling step.
+  - the new board-value path is still a first scalar target transform (`mate -> sign`, `cp -> tanh(cp / 400)`), so the next value-specific decision is whether to keep the scalar-only target or split mate prediction into a separate auxiliary head once we have a longer real-data baseline.
+  - before any new long value run is launched, the training path needs explicit GPU device wiring and a short smoke test that proves actual GPU utilization on this machine.
+- addendum (GPU enforcement + Stockfish value run restart)
+  - code/config actions:
+    - enforced dependency + runtime wiring by adding `CUDA` to `Project.toml`, verifying `CUDA.functional()` and running `Pkg.resolve(); Pkg.instantiate()`
+    - added hard-launch GPU policy in `scripts/run_chess_value_50m_logged.sh` (`WAVEPDE_DEVICE` defaults to `gpu`; run fails on explicit GPU request when no `nvidia-smi` is available)
+    - made `scripts/train_chess_value.jl` default to `WAVEPDE_DEVICE` if unset, then pass-through to `board_value_resolve_device`
+    - fixed GPU-only failures in `src/Core/WavePDECore.jl` (`spectral_laplacian` now keeps frequency grid on the same device type as activations) and `src/Training/Training.jl` (`checker_regression_loss` now uses GPU-safe reduction)
+    - fixed script wrapper and session visibility in `scripts/run_chess_value_50m_logged.sh`
+  - command executed (fresh restart):
+    - `CHESS_DATA_DIR=tmp/value_runtime/stockfish_1m_fixed/train WAVEPDE_MAX_ITERS=8000 WAVEPDE_LOG_INTERVAL=100 WAVEPDE_BATCH_SIZE=4 WAVEPDE_CHUNK_ROWS=20000 WAVEPDE_CHECKPOINT=tmp/value_runtime/stockfish_1m_fixed/checkpoints/value_50m_8k.jls WAVEPDE_LOG_PATH=tmp/value_runtime/stockfish_1m_fixed/checkpoints/value_50m_8k.log bash scripts/run_chess_value_50m_logged.sh`
+  - checkpoint/result status at report time:
+    - running process: `/home/christos/.julia/juliaup/julia-1.12.5+0.aarch64.linux.gnu/bin/julia --project=. scripts/train_chess_value_50m.jl`
+    - log stream confirms GPU placement from the wrapper (`training_device=gpu`) and progress at least to:
+      - `step=1 loss=1.1422 seq_len=210`
+      - `step=100 loss=0.8694 seq_len=210`
+      - `step=200 loss=0.2361 seq_len=210`
+    - observed behavior: CFL clamp warnings remain frequent (`WavePDE value`) on this scale and are now emitted without kernel-fallback crashes.
+  - interpretation:
+    - the CPU-regression cause is resolved; the run is currently in a valid GPU codepath and the previous "1-step then fail" behavior is cleared.
+  - unresolved issue:
+    - the full `8000`-step objective is still running; final checkpoint loss and eval are pending.
+Signature: Codex (GPT-5)

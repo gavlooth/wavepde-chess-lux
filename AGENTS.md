@@ -46,3 +46,15 @@
   2. Do not spend multiple sessions on tiny “safe” tweaks once the pattern of failure is already clear.
   3. When choosing the next step, bias toward the smallest change that can still falsify the current bottleneck hypothesis decisively.
   4. State clearly when a live run must be restarted for a code change to matter; do not leave an old process running and talk as if the new code is active.
+
+## Runtime Launch Guardrails
+
+- Do not start or continue a long-running training job on CPU when the machine has an available supported GPU and the model/workload is large enough that GPU execution is the expected regime.
+- For this repository, value training, state-transition training, and state-policy training must default to GPU execution on GPU-capable hosts.
+  - long runs should set `WAVEPDE_DEVICE=gpu` and treat missing/failed GPU initialization as a hard stop, not a CPU fallback.
+- Before launching any long-running training job expected to last more than a few minutes, explicitly verify:
+  1. whether a supported GPU is present,
+  2. whether the current codepath actually moves model parameters and batches onto that device,
+  3. whether a short smoke run confirms real device utilization.
+- If GPU support is not wired yet, stop and wire it before launching the long run. Do not use a long CPU run as a placeholder benchmark on a GPU-capable machine unless the user explicitly approves that tradeoff.
+- If observability is incomplete, fix logging/checkpoint visibility before launching the long run. Do not leave a high-cost process running if the first optimization step and progress path cannot be verified from logs.

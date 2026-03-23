@@ -103,6 +103,21 @@ function write_test_transcript_parquet(path::AbstractString)
     return path
 end
 
+function write_test_value_parquet(path::AbstractString)
+    conn = DBInterface.connect(DuckDB.DB, ":memory:")
+    DBInterface.execute(conn, """
+        CREATE TABLE toy AS
+        SELECT 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1' AS fen, 20 AS depth, 0.0 AS cp, CAST(NULL AS DOUBLE) AS mate
+        UNION ALL
+        SELECT 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1' AS fen, 24 AS depth, 120.0 AS cp, CAST(NULL AS DOUBLE) AS mate
+        UNION ALL
+        SELECT 'r1bqkbnr/pppp1ppp/2n5/4p3/1b2P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3' AS fen, 28 AS depth, CAST(NULL AS DOUBLE) AS cp, 3.0 AS mate
+    """)
+    escaped_path = replace(path, "'" => "''")
+    DBInterface.execute(conn, "COPY toy TO '$escaped_path' (FORMAT PARQUET)")
+    return path
+end
+
 @testset "WavePDEChess" begin
     rng = Random.default_rng()
     Random.seed!(rng, 0)
@@ -174,18 +189,6 @@ end
     @test preset.core.d_model == 288
     @test preset.core.n_layer == 20
     @test preset.max_seq_len == 1536
-
-    airy_preset = chess_airy_11m_config()
-    @test airy_preset.core isa DispersionConfig
-    @test airy_preset.core.channels == 288
-    @test airy_preset.core.n_layer == 20
-    @test airy_preset.max_seq_len == 1536
-
-    airy_model = ChessModel(AiryPDEConfig())
-    airy_ps, airy_st = Lux.setup(rng, airy_model)
-    airy_tokens = rand(rng, 0:27, 32, 2)
-    airy_logits, _ = Lux.apply(airy_model, airy_tokens, airy_ps, airy_st)
-    @test size(airy_logits) == (28, 32, 2)
 
 end
 
@@ -371,6 +374,8 @@ end
 
     corpus = StateTransitionParquetCorpus(parquet_dir; min_tokens=BOARD_STATE_SEQUENCE_LENGTH)
     @test corpus.active_moves !== nothing
+    @test corpus.active_probe_targets !== nothing
+    @test corpus.probe_target_dim == BOARD_PROBE_TARGET_LENGTH
     @test first(corpus.active_moves) == "e4"
     batch = WavePDEChess.sample_training_batch(
         corpus,
@@ -380,6 +385,10 @@ end
     )
     @test size(batch.tokens) == (BOARD_STATE_SEQUENCE_LENGTH, 2)
     @test size(batch.target_tokens) == (BOARD_STATE_SEQUENCE_LENGTH, 2)
+    @test size(batch.checker_targets) == (BOARD_PROBE_TARGET_LENGTH, 2)
+    split_probes = WavePDEChess.split_board_probe_targets(batch.checker_targets)
+    @test size(split_probes.attacked_white) == (64, 2)
+    @test size(split_probes.mobility) == (2, 2)
     family_metrics = state_slot_family_metrics(batch.target_tokens, batch.target_tokens)
     legality_metrics = successor_legality_metrics(batch.tokens, batch.target_tokens)
     @test isapprox(family_metrics.coarse_state.token_accuracy, 1.0; atol=1f-6)
@@ -555,6 +564,8 @@ end
     @test !isempty(corpus.active_states)
     @test length(first(corpus.active_states)) == BOARD_STATE_SEQUENCE_LENGTH
     @test length(first(corpus.active_next_states)) == BOARD_STATE_SEQUENCE_LENGTH
+    @test corpus.active_probe_targets !== nothing
+    @test corpus.probe_target_dim == BOARD_PROBE_TARGET_LENGTH
 end
 
 @testset "State Transition Evaluation" begin
@@ -627,6 +638,79 @@ end
     @test 0.0 <= result.successor_legality_metrics.reachable_strict_rate <= 1.0
 end
 
+@testset "State Probe Supervision" begin
+    rng = MersenneTwister(141)
+    tempdir = mktempdir()
+    train_dir = joinpath(tempdir, "train")
+    eval_dir = joinpath(tempdir, "eval")
+    mkpath(train_dir)
+    mkpath(eval_dir)
+    write_test_pgn(joinpath(train_dir, "train_game.pgn"))
+    write_test_pgn(joinpath(eval_dir, "eval_game.pgn"))
+
+    train_parquet_dir = joinpath(tempdir, "train_parquet")
+    eval_parquet_dir = joinpath(tempdir, "eval_parquet")
+    write_pgn_state_parquet(train_dir, train_parquet_dir)
+    write_pgn_state_parquet(eval_dir, eval_parquet_dir)
+
+    corpus = StateTransitionParquetCorpus(train_parquet_dir; min_tokens=BOARD_STATE_SEQUENCE_LENGTH)
+    batch = WavePDEChess.sample_training_batch(
+        corpus,
+        rng;
+        batch_size=2,
+        max_seq_len=BOARD_STATE_SEQUENCE_LENGTH + 1 + WavePDEChess.MAX_POLICY_ACTION_TOKENS,
+        policy_condition_mode=:state_action,
+        state_target_mode=:coarse_only,
+    )
+    @test batch.checker_targets !== nothing
+    @test size(batch.checker_targets) == (BOARD_PROBE_TARGET_LENGTH, 2)
+
+    config = ChessMultiHeadModelConfig(
+        adapter=ChessAdapterConfig(vocab_size=WavePDEChess.STATE_ACTION_VOCAB_SIZE, d_model=16, pad_token=0),
+        core=WavePDECoreConfig(d_model=16, n_layer=2, solver_steps=1, dt_init=0.05f0, norm_eps=1f-5),
+        proposer=ChessMoveHeadConfig(vocab_size=WavePDEChess.STATE_ACTION_VOCAB_SIZE, d_model=16, tie_embeddings=true, bias=false),
+        checker=ChessCheckerHeadConfig(d_model=16, output_dim=BOARD_PROBE_TARGET_LENGTH, pooling=:mean),
+        max_seq_len=BOARD_STATE_SEQUENCE_LENGTH + 1 + WavePDEChess.MAX_POLICY_ACTION_TOKENS,
+    )
+    model = ChessMultiHeadModel(config)
+    ps, st = Lux.setup(rng, model)
+    loss = WavePDEChess.autoregressive_loss(model, ps, st, batch; checker_loss_weight=0.25f0)
+    @test isfinite(loss)
+
+    train_cfg = TrainingConfig(
+        data_dir=train_parquet_dir,
+        batch_size=2,
+        max_iters=1,
+        log_interval=1,
+        min_tokens=BOARD_STATE_SEQUENCE_LENGTH,
+        train_file_update_interval=1,
+        probe_loss_weight=0.25f0,
+        policy_condition_mode=:state_action,
+        state_target_mode=:coarse_only,
+        checkpoint_path=joinpath(tempdir, "wavepde_state_probe_ckpt.jls"),
+        seed=141,
+    )
+    checkpoint = WavePDEChess.train!(model, corpus, train_cfg)
+    @test isfile(train_cfg.checkpoint_path)
+    @test checkpoint.model_config isa ChessMultiHeadModelConfig
+
+    loaded = load_state_transition_checkpoint(train_cfg.checkpoint_path)
+    @test loaded.model isa ChessMultiHeadModel
+
+    result = evaluate_state_transition_checkpoint(
+        train_cfg.checkpoint_path,
+        eval_parquet_dir;
+        batch_size=2,
+        policy_condition_mode=:state_action,
+        state_target_mode=:coarse_only,
+    )
+    @test result.probe_metrics !== nothing
+    @test 0.0 <= result.probe_metrics.attacked_white.overall_accuracy <= 1.0
+    @test 0.0 <= result.probe_metrics.attacked_black.exact_match_rate <= 1.0
+    @test isfinite(result.probe_metrics.pinned_count.mse)
+    @test isfinite(result.probe_metrics.mobility.rmse)
+end
+
 @testset "State Transition Mode Comparison" begin
     tempdir = mktempdir()
     pgn_dir = joinpath(tempdir, "pgn")
@@ -659,6 +743,76 @@ end
     @test isfinite(result.state_action.eval.token_loss)
     @test 0.0 <= result.state_only.eval.exact_slot_accuracy <= 1.0
     @test 0.0 <= result.state_action.eval.exact_slot_accuracy <= 1.0
+end
+
+@testset "Board Value Training" begin
+    rng = MersenneTwister(73)
+    tempdir = mktempdir()
+    parquet_path = write_test_value_parquet(joinpath(tempdir, "toy_value.parquet"))
+
+    @test WavePDEChess.value_target_from_engine_eval(0.0, missing; cp_scale=400f0) ≈ 0.0f0 atol=1f-6
+    @test WavePDEChess.value_target_from_engine_eval(400.0, missing; cp_scale=400f0) ≈ tanh(1.0f0) atol=1f-6
+    @test WavePDEChess.value_target_from_engine_eval(missing, 3.0; cp_scale=400f0) == 1.0f0
+
+    corpus = BoardValueParquetCorpus(tempdir; chunk_rows=2, cp_scale=400f0)
+    @test length(corpus.active_states) == 2
+    @test length(corpus.active_values) == 2
+    @test corpus.file_row_counts[parquet_path] == 3
+    @test first(corpus.active_states) == board_state_tokens_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+
+    WavePDEChess.reload_file!(corpus, parquet_path; offset=2)
+    @test length(corpus.active_states) == 1
+    @test corpus.active_values[1] == 1.0f0
+
+    WavePDEChess.reload_file!(corpus, parquet_path; offset=0)
+    batch = WavePDEChess.sample_board_value_batch(corpus, rng; batch_size=2, max_seq_len=BOARD_STATE_SEQUENCE_LENGTH)
+    @test size(batch.tokens) == (BOARD_STATE_SEQUENCE_LENGTH, 2)
+    @test size(batch.value_targets) == (1, 2)
+
+    config = BoardValueModelConfig(
+        adapter=ChessAdapterConfig(vocab_size=BOARD_STATE_VOCAB_SIZE, d_model=16, pad_token=0),
+        core=WavePDECoreConfig(d_model=16, n_layer=2, solver_steps=1, dt_init=0.05f0, norm_eps=1f-5),
+        value_head=ChessCheckerHeadConfig(d_model=16, output_dim=1, pooling=:mean),
+        max_seq_len=BOARD_STATE_SEQUENCE_LENGTH,
+    )
+    model = BoardValueModel(config)
+    ps, st = Lux.setup(rng, model)
+    loss = WavePDEChess.board_value_loss(model, ps, st, batch)
+    grads = Zygote.gradient(p -> WavePDEChess.board_value_loss(model, p, st, batch), ps)[1]
+    @test isfinite(loss)
+    @test parameter_count(grads) > 0
+
+    train_cfg = BoardValueTrainingConfig(
+        data_dir=tempdir,
+        batch_size=2,
+        learning_rate=1.0f-3,
+        max_iters=1,
+        log_interval=1,
+        min_tokens=BOARD_STATE_SEQUENCE_LENGTH,
+        train_file_update_interval=1,
+        cp_scale=400f0,
+        chunk_rows=2,
+        checkpoint_path=joinpath(tempdir, "wavepde_value_ckpt.jls"),
+        seed=73,
+    )
+    checkpoint = train_value!(model, corpus, train_cfg)
+    @test isfile(train_cfg.checkpoint_path)
+    @test length(checkpoint.losses) == 1
+
+    loaded = load_board_value_checkpoint(train_cfg.checkpoint_path)
+    @test loaded.model isa BoardValueModel
+
+    result = evaluate_board_value_checkpoint(
+        train_cfg.checkpoint_path,
+        tempdir;
+        batch_size=2,
+        max_examples=3,
+        chunk_rows=2,
+    )
+    @test result.num_examples == 3
+    @test isfinite(result.mse)
+    @test isfinite(result.rmse)
+    @test 0.0 <= result.direction_accuracy <= 1.0
 end
 
 @testset "Transition Consistency Training" begin
@@ -1117,115 +1271,4 @@ end
     @test isfinite(result.hybrid.final_loss)
     @test isfinite(result.hybrid.final_state_loss)
     @test isfinite(result.hybrid.final_transcript_loss)
-end
-
-@testset "DispersivePDE Module" begin
-    rng = MersenneTwister(101)
-    @test isdefined(WavePDEChess, :DispersivePDE)
-    @test WavePDEChess.DispersionConfig === WavePDEChess.DispersivePDE.DispersionConfig
-    @test WavePDEChess.DispersiveBlock === WavePDEChess.DispersivePDE.DispersiveBlock
-    @test WavePDEChess.DispersiveStack === WavePDEChess.DispersivePDE.DispersiveStack
-
-    cfg = WavePDEChess.DispersionConfig(
-        channels=4,
-        n_layer=2,
-        length=8,
-        dt_init=0.1f0,
-        dt_floor=1f-4,
-        alpha_init=0.02f0,
-        alpha_floor=1f-4,
-        beta_init=0.03f0,
-        phase_limit=0.5f0,
-        decay_limit=0.5f0,
-        residual_init_scale=0.1f0,
-    )
-
-    model = WavePDEChess.DispersiveStack(2, cfg)
-    ps, st = Lux.setup(rng, model)
-    x = randn(rng, Float32, cfg.channels, cfg.length, 3)
-    y, st_next = Lux.apply(model, x, ps, st)
-    grid = WavePDEChess.frequency_grid(cfg.length)
-    grid_step = 2f0 * Float32(pi) / cfg.length
-
-    @test size(y) == size(x)
-    @test all(isfinite, y)
-    @test st_next == st
-    @test grid ≈ grid_step .* Float32[0, 1, 2, 3, -4, -3, -2, -1] atol=1f-6
-
-    dt_eff, airy_stats = WavePDEChess.DispersivePDE.airy_operator_control(
-        fill(0.5f0, cfg.channels),
-        fill(4.0f0, cfg.channels),
-        10.0f0,
-        grid,
-        cfg.decay_limit,
-        cfg.phase_limit,
-        cfg.stability_eps,
-    )
-    @test dt_eff < 10.0f0
-    @test airy_stats.clamped_decay || airy_stats.clamped_phase
-    @test airy_stats.max_phase > cfg.phase_limit
-
-    block = WavePDEChess.DispersiveBlock(cfg)
-    block_ps = Lux.initialparameters(rng, block)
-    block_st = Lux.initialstates(rng, block)
-    aggressive_ps = (; block_ps..., beta_raw=fill(200.0f0, cfg.channels), log_dt=Float32[10.0f0])
-    @test_logs (:warn, r"DispersiveBlock stability control clamped dt") first(block(x, aggressive_ps, block_st))
-
-    quiet_cfg = WavePDEChess.DispersionConfig(
-        channels=cfg.channels,
-        length=cfg.length,
-        dt_init=cfg.dt_init,
-        dt_floor=cfg.dt_floor,
-        alpha_init=cfg.alpha_init,
-        alpha_floor=cfg.alpha_floor,
-        beta_init=cfg.beta_init,
-        phase_limit=cfg.phase_limit,
-        decay_limit=cfg.decay_limit,
-        residual_init_scale=cfg.residual_init_scale,
-        norm_eps=cfg.norm_eps,
-        stability_eps=cfg.stability_eps,
-        warn_on_clamp=false,
-    )
-    quiet_block = WavePDEChess.DispersiveBlock(quiet_cfg)
-    quiet_block_ps = Lux.initialparameters(rng, quiet_block)
-    quiet_block_st = Lux.initialstates(rng, quiet_block)
-    quiet_aggressive_ps = (; quiet_block_ps..., beta_raw=fill(200.0f0, cfg.channels), log_dt=Float32[10.0f0])
-    clamp_grads = Zygote.gradient(
-        p -> sum(first(quiet_block(x, p, quiet_block_st))),
-        quiet_aggressive_ps,
-    )[1]
-    @test parameter_count(clamp_grads) > 0
-    @test all(isfinite, clamp_grads.in_weight)
-    @test all(isfinite, clamp_grads.beta_raw)
-    @test all(isfinite, clamp_grads.log_dt)
-
-    dataset = WavePDEChess.DispersivePDE.make_identity_dataset(cfg.channels, cfg.length, 2, 2; rng=rng)
-    result = WavePDEChess.DispersivePDE.train!(model, dataset; epochs=1, lr=1f-3, rng=rng)
-
-    @test length(result.losses) == 1
-    @test isfinite(result.losses[1])
-    @test tree_changed(ps, result.parameters)
-
-    model_config = ChessModelConfig(
-        adapter=ChessAdapterConfig(vocab_size=32, d_model=4, pad_token=0),
-        core=WavePDEChess.DispersionConfig(
-            channels=4,
-            n_layer=2,
-            length=12,
-            dt_init=0.05f0,
-            dt_floor=1f-4,
-            alpha_init=0.02f0,
-            alpha_floor=1f-4,
-            beta_init=0.03f0,
-            residual_init_scale=0.1f0,
-        ),
-        proposer=ChessMoveHeadConfig(vocab_size=32, d_model=4, tie_embeddings=false, bias=true),
-        max_seq_len=12,
-    )
-    sequence_model = ChessModel(model_config)
-    seq_ps, seq_st = Lux.setup(rng, sequence_model)
-    short_tokens = rand(rng, 0:31, 8, 2)
-    short_logits, _ = Lux.apply(sequence_model, short_tokens, seq_ps, seq_st)
-    @test size(short_logits) == (32, 8, 2)
-    @test all(isfinite, short_logits)
 end

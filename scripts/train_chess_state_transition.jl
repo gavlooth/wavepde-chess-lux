@@ -18,36 +18,15 @@ function env_symbol(name::String, default::Symbol)
 end
 
 function build_state_transition_core_config(d_model::Int, max_seq_len::Int)
-    core_kind = env_symbol("WAVEPDE_CORE_KIND", :wavepde)
-    if core_kind == :wavepde
-        return WavePDECoreConfig(
-            d_model=d_model,
-            n_layer=env_int("WAVEPDE_N_LAYER", 20),
-            solver_steps=env_int("WAVEPDE_SOLVER_STEPS", 4),
-            dt_init=env_float32("WAVEPDE_DT_INIT", 0.05f0),
-            norm_eps=env_float32("WAVEPDE_NORM_EPS", 1f-5),
-            cfl_safety_factor=env_float32("WAVEPDE_CFL_SAFETY_FACTOR", 0.95f0),
-            cfl_eps=env_float32("WAVEPDE_CFL_EPS", 1f-6),
-        )
-    elseif core_kind == :airy
-        return DispersionConfig(
-            channels=d_model,
-            n_layer=env_int("WAVEPDE_N_LAYER", 20),
-            length=max_seq_len,
-            dt_init=env_float32("AIRYPDE_DT_INIT", 0.05f0),
-            dt_floor=env_float32("AIRYPDE_DT_FLOOR", 1f-4),
-            alpha_init=env_float32("AIRYPDE_ALPHA_INIT", 0.01f0),
-            alpha_floor=env_float32("AIRYPDE_ALPHA_FLOOR", 1f-4),
-            beta_init=env_float32("AIRYPDE_BETA_INIT", 0.01f0),
-            phase_limit=env_float32("AIRYPDE_PHASE_LIMIT", Float32(pi)),
-            decay_limit=env_float32("AIRYPDE_DECAY_LIMIT", 2.0f0),
-            residual_init_scale=env_float32("AIRYPDE_RESIDUAL_INIT_SCALE", 0.1f0),
-            norm_eps=env_float32("WAVEPDE_NORM_EPS", 1f-5),
-            stability_eps=env_float32("AIRYPDE_STABILITY_EPS", 1f-6),
-            warn_on_clamp=env_bool("AIRYPDE_WARN_ON_CLAMP", true),
-        )
-    end
-    throw(ArgumentError("Unsupported WAVEPDE_CORE_KIND=$(core_kind). Use :wavepde or :airy."))
+    return WavePDECoreConfig(
+        d_model=d_model,
+        n_layer=env_int("WAVEPDE_N_LAYER", 20),
+        solver_steps=env_int("WAVEPDE_SOLVER_STEPS", 4),
+        dt_init=env_float32("WAVEPDE_DT_INIT", 0.05f0),
+        norm_eps=env_float32("WAVEPDE_NORM_EPS", 1f-5),
+        cfl_safety_factor=env_float32("WAVEPDE_CFL_SAFETY_FACTOR", 0.95f0),
+        cfl_eps=env_float32("WAVEPDE_CFL_EPS", 1f-6),
+    )
 end
 
 function maybe_prepare_state_transition_data()
@@ -85,25 +64,10 @@ function run_chess_state_transition_training()
     default_max_seq_len = policy_condition_mode == :state_action ?
         BOARD_STATE_SEQUENCE_LENGTH + 1 + WavePDEChess.MAX_POLICY_ACTION_TOKENS :
         BOARD_STATE_SEQUENCE_LENGTH
+    probe_loss_weight = env_float32("WAVEPDE_PROBE_LOSS_WEIGHT", 0.0f0)
     d_model = env_int("WAVEPDE_D_MODEL", 288)
     max_seq_len = env_int("WAVEPDE_MAX_SEQ_LEN", default_max_seq_len)
     core_config = build_state_transition_core_config(d_model, max_seq_len)
-
-    model_config = ChessModelConfig(
-        adapter=ChessAdapterConfig(
-            vocab_size=env_int("WAVEPDE_VOCAB_SIZE", default_vocab_size),
-            d_model=d_model,
-            pad_token=env_int("WAVEPDE_PAD_TOKEN", 0),
-        ),
-        core=core_config,
-        proposer=ChessMoveHeadConfig(
-            vocab_size=env_int("WAVEPDE_VOCAB_SIZE", default_vocab_size),
-            d_model=d_model,
-            tie_embeddings=true,
-            bias=false,
-        ),
-        max_seq_len=max_seq_len,
-    )
 
     train_config = TrainingConfig(
         data_dir=data_dir,
@@ -114,6 +78,7 @@ function run_chess_state_transition_training()
         min_tokens=env_int("WAVEPDE_MIN_TOKENS", BOARD_STATE_SEQUENCE_LENGTH),
         train_file_update_interval=env_int("WAVEPDE_FILE_ROTATE", 10),
         training_policy=env_symbol("WAVEPDE_TRAINING_POLICY", :full),
+        probe_loss_weight=probe_loss_weight,
         policy_condition_mode=policy_condition_mode,
         state_target_mode=env_symbol("WAVEPDE_STATE_TARGET_MODE", :full),
         checkpoint_path=get(
@@ -123,17 +88,52 @@ function run_chess_state_transition_training()
         ),
         seed=env_int("WAVEPDE_SEED", 1337),
     )
+    corpus = StateTransitionParquetCorpus(train_config.data_dir; min_tokens=train_config.min_tokens)
+    vocab_size = env_int("WAVEPDE_VOCAB_SIZE", default_vocab_size)
+    adapter_config = ChessAdapterConfig(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        pad_token=env_int("WAVEPDE_PAD_TOKEN", 0),
+    )
+    proposer_config = ChessMoveHeadConfig(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        tie_embeddings=true,
+        bias=false,
+    )
+    probe_supervision_enabled = probe_loss_weight > 0 && corpus.active_probe_targets !== nothing
+    model_config = if probe_supervision_enabled
+        ChessMultiHeadModelConfig(
+            adapter=adapter_config,
+            core=core_config,
+            proposer=proposer_config,
+            checker=ChessCheckerHeadConfig(
+                d_model=d_model,
+                output_dim=corpus.probe_target_dim,
+                pooling=:mean,
+            ),
+            max_seq_len=max_seq_len,
+        )
+    else
+        ChessModelConfig(
+            adapter=adapter_config,
+            core=core_config,
+            proposer=proposer_config,
+            max_seq_len=max_seq_len,
+        )
+    end
 
     println("entrypoint=train_chess_state_transition paired_state_supervision=true")
     println("data_dir=$(train_config.data_dir)")
     println("batch_size=$(train_config.batch_size) max_iters=$(train_config.max_iters) lr=$(train_config.learning_rate)")
     println("vocab_size=$(model_config.adapter.vocab_size) max_seq_len=$(model_config.max_seq_len)")
-    println("core_kind=$(env_symbol("WAVEPDE_CORE_KIND", :wavepde))")
     println("training_policy=$(train_config.training_policy) policy_condition_mode=$(train_config.policy_condition_mode) state_target_mode=$(train_config.state_target_mode)")
+    println("probe_loss_weight=$(train_config.probe_loss_weight)")
+    println("probe_supervision_enabled=$(probe_supervision_enabled)")
+    probe_supervision_enabled && println("probe_target_dim=$(corpus.probe_target_dim)")
     println("checkpoint=$(train_config.checkpoint_path)")
 
-    model = ChessModel(model_config)
-    corpus = StateTransitionParquetCorpus(train_config.data_dir; min_tokens=train_config.min_tokens)
+    model = probe_supervision_enabled ? ChessMultiHeadModel(model_config) : ChessModel(model_config)
     checkpoint = train!(model, corpus, train_config)
 
     println("saved checkpoint to $(train_config.checkpoint_path)")

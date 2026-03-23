@@ -38,8 +38,10 @@ end
 
 function spectral_laplacian(u::AbstractArray{T, 3}) where {T<:AbstractFloat}
     k = spectral_modes(size(u, 2), T)
-    u_hat = FFTW.fft(complex.(u), 2)
-    lap_hat = (-k .^ 2) .* u_hat
+    if u isa CUDA.AbstractGPUArray
+        k = CUDA.CuArray(k)
+    end
+    lap_hat = FFTW.fft(complex.(u), 2) .* (-k .^ 2)
     return T.(real.(FFTW.ifft(lap_hat, 2)))
 end
 

@@ -31,15 +31,15 @@ using Random
 using Serialization
 using Statistics: mean
 using Zygote
+using CUDA
 
 export WavePDECoreConfig,
-    AiryPDEConfig,
-    DispersionConfig,
     ChessAdapterConfig,
     ChessMoveHeadConfig,
     ChessCheckerHeadConfig,
     ChessModelConfig,
     ChessMultiHeadModelConfig,
+    BoardValueModelConfig,
     DualSurfaceStateModelConfig,
     DualSurfaceTrainingConfig,
     WavePDECore,
@@ -51,6 +51,7 @@ export WavePDECoreConfig,
     ChessCheckerHead,
     ChessModel,
     ChessMultiHeadModel,
+    BoardValueModel,
     DualSurfaceStateModel,
     WavePDEConfig,
     WavePDEChessLM,
@@ -58,23 +59,27 @@ export WavePDECoreConfig,
     ChessParquetCorpus,
     DualSurfaceParquetCorpus,
     StateTransitionParquetCorpus,
-    chess_airy_11m_config,
+    BoardValueParquetCorpus,
+    BoardValueTrainingConfig,
     chess_mamba_11m_config,
-    DispersivePDE,
-    DispersiveBlock,
-    DispersiveStack,
     autoregressive_cross_entropy,
     CHESS_BOARD_TARGET_NAMES,
     BOARD_STATE_VOCAB_SIZE,
     BOARD_STATE_COARSE_LENGTH,
     BOARD_STATE_SEQUENCE_LENGTH,
+    BOARD_PROBE_TARGET_LENGTH,
     board_fact_metrics,
     board_probe_metrics,
     board_state_tokens,
     board_probe_targets_from_payload,
     board_probe_targets_from_tokens,
     board_probe_targets_from_transcript,
+    flatten_board_probe_targets,
+    split_board_probe_targets,
     board_state_tokens_from_transcript,
+    board_state_tokens_from_fen,
+    value_target_from_engine_eval,
+    board_value_metrics,
     candidate_legality_targets,
     candidate_legality_metrics,
     checker_prediction_metrics,
@@ -98,6 +103,8 @@ export WavePDECoreConfig,
     compare_state_transition_training_modes,
     evaluate_state_transition_corpus,
     evaluate_state_transition_checkpoint,
+    evaluate_board_value_corpus,
+    evaluate_board_value_checkpoint,
     state_transition_eval_data_dir,
     state_slot_family_metrics,
     successor_legality_metrics,
@@ -112,29 +119,27 @@ export WavePDECoreConfig,
     write_transcript_language_parquet,
     write_transcript_state_parquet,
     write_pgn_state_parquet,
-    frequency_grid,
     proposer_topk,
     rerank_next_token_candidates,
     proposer_output,
     checker_output,
+    load_board_value_checkpoint,
     parameter_count,
     sample_batch,
     sample_dual_surface_batch,
     dual_surface_loss,
     train_dual_surface!,
+    train_value!,
     compare_surface_training_modes,
     train!
 
 include("Core/WavePDECore.jl")
-include("DisparsivePDE.jl")
 
-const SequenceCoreConfig = Union{WavePDECoreConfig, DispersivePDE.DispersionConfig}
+const SequenceCoreConfig = WavePDECoreConfig
 
 core_d_model(config::WavePDECoreConfig) = config.d_model
-core_d_model(config::DispersivePDE.DispersionConfig) = config.channels
 
 build_sequence_core(config::WavePDECoreConfig) = WavePDECore(config)
-build_sequence_core(config::DispersivePDE.DispersionConfig) = DispersiveStack(config)
 
 include("Heads/Interfaces.jl")
 include("Adapters/ChessInputAdapter.jl")
@@ -142,12 +147,15 @@ include("Heads/ChessMoveHead.jl")
 include("Heads/ChessCheckerHead.jl")
 include("Models/ChessModel.jl")
 include("Models/ChessMultiHeadModel.jl")
+include("Models/ChessValueModel.jl")
 include("Training/ChessTargets.jl")
 include("Training/PGNStateData.jl")
+include("Training/FENValueData.jl")
 include("Training/PolicyTargets.jl")
 include("Training/StateTransitionEval.jl")
 include("Training/TranscriptStateData.jl")
 include("Training/Training.jl")
+include("Training/ValueTraining.jl")
 include("Training/DualSurfaceTraining.jl")
 include("Training/CheckerMetrics.jl")
 using .CheckerMetrics:
@@ -157,11 +165,6 @@ using .CheckerMetrics:
     checker_prediction_metrics,
     state_slot_family_metrics,
     rerank_comparison_metrics
-using .DispersivePDE:
-    DispersionConfig,
-    DispersiveBlock,
-    DispersiveStack,
-    frequency_grid
 
 Base.@kwdef struct WavePDEConfig
     vocab_size::Int = 28
@@ -173,25 +176,6 @@ Base.@kwdef struct WavePDEConfig
     norm_eps::Float32 = 1f-5
     cfl_safety_factor::Float32 = 0.95f0
     cfl_eps::Float32 = 1f-6
-    pad_token::Int = 0
-end
-
-Base.@kwdef struct AiryPDEConfig
-    vocab_size::Int = 28
-    d_model::Int = 288
-    n_layer::Int = 20
-    max_seq_len::Int = 1536
-    dt_init::Float32 = 0.05f0
-    dt_floor::Float32 = 1f-4
-    alpha_init::Float32 = 0.01f0
-    alpha_floor::Float32 = 1f-4
-    beta_init::Float32 = 0.01f0
-    phase_limit::Float32 = Float32(pi)
-    decay_limit::Float32 = 2.0f0
-    residual_init_scale::Float32 = 0.1f0
-    norm_eps::Float32 = 1f-5
-    stability_eps::Float32 = 1f-6
-    warn_on_clamp::Bool = true
     pad_token::Int = 0
 end
 
@@ -209,42 +193,6 @@ function ChessModelConfig(config::WavePDEConfig)
         norm_eps=config.norm_eps,
         cfl_safety_factor=config.cfl_safety_factor,
         cfl_eps=config.cfl_eps,
-    )
-    proposer = ChessMoveHeadConfig(
-        vocab_size=config.vocab_size,
-        d_model=config.d_model,
-        tie_embeddings=true,
-        bias=false,
-    )
-    return ChessModelConfig(
-        adapter=adapter,
-        core=core,
-        proposer=proposer,
-        max_seq_len=config.max_seq_len,
-    )
-end
-
-function ChessModelConfig(config::AiryPDEConfig)
-    adapter = ChessAdapterConfig(
-        vocab_size=config.vocab_size,
-        d_model=config.d_model,
-        pad_token=config.pad_token,
-    )
-    core = DispersionConfig(
-        channels=config.d_model,
-        n_layer=config.n_layer,
-        length=config.max_seq_len,
-        dt_init=config.dt_init,
-        dt_floor=config.dt_floor,
-        alpha_init=config.alpha_init,
-        alpha_floor=config.alpha_floor,
-        beta_init=config.beta_init,
-        phase_limit=config.phase_limit,
-        decay_limit=config.decay_limit,
-        residual_init_scale=config.residual_init_scale,
-        norm_eps=config.norm_eps,
-        stability_eps=config.stability_eps,
-        warn_on_clamp=config.warn_on_clamp,
     )
     proposer = ChessMoveHeadConfig(
         vocab_size=config.vocab_size,
@@ -284,44 +232,7 @@ function chess_mamba_11m_config(
     )
 end
 
-function chess_airy_11m_config(
-    ;
-    vocab_size::Int=28,
-    dt_init::Float32=0.05f0,
-    dt_floor::Float32=1f-4,
-    alpha_init::Float32=0.01f0,
-    alpha_floor::Float32=1f-4,
-    beta_init::Float32=0.01f0,
-    phase_limit::Float32=Float32(pi),
-    decay_limit::Float32=2.0f0,
-    residual_init_scale::Float32=0.1f0,
-    stability_eps::Float32=1f-6,
-    warn_on_clamp::Bool=true,
-)
-    return ChessModelConfig(
-        AiryPDEConfig(
-            vocab_size=vocab_size,
-            d_model=288,
-            n_layer=20,
-            max_seq_len=1536,
-            dt_init=dt_init,
-            dt_floor=dt_floor,
-            alpha_init=alpha_init,
-            alpha_floor=alpha_floor,
-            beta_init=beta_init,
-            phase_limit=phase_limit,
-            decay_limit=decay_limit,
-            residual_init_scale=residual_init_scale,
-            norm_eps=1f-5,
-            stability_eps=stability_eps,
-            warn_on_clamp=warn_on_clamp,
-            pad_token=0,
-        ),
-    )
-end
-
 ChessModel(config::WavePDEConfig) = ChessModel(ChessModelConfig(config))
-ChessModel(config::AiryPDEConfig) = ChessModel(ChessModelConfig(config))
 
 const WavePDEChessLM = ChessModel
 

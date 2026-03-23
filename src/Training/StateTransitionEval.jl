@@ -155,7 +155,11 @@ function load_state_transition_checkpoint(checkpoint_path::AbstractString)
         deserialize(io)
     end
     haskey(payload, :model_config) || throw(ArgumentError("Checkpoint $(checkpoint_path) is missing a model_config field."))
-    model = WavePDEChess.WavePDEChessLM(payload.model_config)
+    model = if payload.model_config isa WavePDEChess.ChessMultiHeadModelConfig
+        WavePDEChess.ChessMultiHeadModel(payload.model_config)
+    else
+        WavePDEChess.WavePDEChessLM(payload.model_config)
+    end
     ps = payload.parameters
     st = payload.state
     return (payload=payload, model=model, parameters=ps, state=st)
@@ -287,6 +291,73 @@ function argmax_tokens(logits::AbstractArray{<:Real, 3})
     return tokens
 end
 
+function legal_successor_states_tokens(source_tokens::AbstractVector{<:Integer})
+    board = try
+        pycall(py"wavepde_board_from_state_tokens", PyAny, collect(Int.(source_tokens)))
+    catch
+        return Vector{Int32}[]
+    end
+    
+    if !pycall(board.is_valid, Bool)
+        return Vector{Int32}[]
+    end
+    
+    candidates = Vector{Vector{Int32}}()
+    for move in board.legal_moves
+        candidate_board = pycall(board.copy, PyAny; stack=false)
+        pycall(candidate_board.push, PyAny, move)
+        payload = pycall(py"_wavepde_board_state_payload", PyAny, candidate_board)
+        push!(candidates, WavePDEChess.board_state_tokens(payload))
+    end
+    
+    return candidates
+end
+
+function legality_aware_decode(logits::AbstractArray{<:Real, 3}, source_states::AbstractMatrix{<:Integer}, state_target_mode::Symbol)
+    vocab_size, seq_len, batch_size = size(logits)
+    predicted_tokens = zeros(Int32, seq_len, batch_size)
+    fallback_all = argmax_tokens(logits)
+    
+    for batch_idx in 1:batch_size
+        source_tokens = collect(Int.(view(source_states, :, batch_idx)))
+        fallback_tokens = view(fallback_all, :, batch_idx)
+        
+        legal_candidates = legal_successor_states_tokens(source_tokens)
+        
+        if isempty(legal_candidates)
+            predicted_tokens[:, batch_idx] .= fallback_tokens
+            continue
+        end
+        
+        best_score = -Inf
+        best_candidate = fallback_tokens
+        
+        target_len = WavePDEChess.state_target_length(first(legal_candidates), state_target_mode)
+        
+        for candidate in legal_candidates
+            len = min(length(candidate), seq_len, target_len)
+            
+            score = 0.0
+            for i in 1:len
+                token = candidate[i]
+                if 0 <= token < vocab_size
+                    score += Float64(logits[token + 1, i, batch_idx])
+                end
+            end
+            
+            if score > best_score
+                best_score = score
+                best_candidate = copy(fallback_tokens)
+                best_candidate[1:len] .= candidate[1:len]
+            end
+        end
+        
+        predicted_tokens[:, batch_idx] .= best_candidate
+    end
+    
+    return predicted_tokens
+end
+
 function state_fact_matrix(state_tokens::AbstractMatrix{<:Integer})
     num_facts = length(WavePDEChess.CHESS_BOARD_TARGET_NAMES)
     facts = zeros(Float32, num_facts, size(state_tokens, 2))
@@ -332,7 +403,7 @@ function successor_legality_metrics(source_states::AbstractMatrix{<:Integer}, pr
     )
 end
 
-function evaluate_state_transition_batches(model, ps, st, states, next_states; batch_size::Int)
+function evaluate_state_transition_batches(model, ps, st, states, next_states; batch_size::Int, decoding_mode::Symbol=:unconstrained, state_target_mode::Symbol=:full)
     max_seq_len = size(first(states), 1)
     total_loss = 0.0
     total_tokens = 0
@@ -347,10 +418,15 @@ function evaluate_state_transition_batches(model, ps, st, states, next_states; b
     target_fact_cols = Matrix{Float32}(undef, length(WavePDEChess.CHESS_BOARD_TARGET_NAMES), 0)
 
     for start_idx in 1:batch_size:length(states)
-        inputs, targets = pack_state_transition_batch(states, next_states, start_idx, batch_size, max_seq_len)
-        loss, output = WavePDEChess.paired_token_prediction_loss(model, ps, st, inputs, targets)
+        inputs, targets, target_mask, source_states = pack_state_transition_batch(states, next_states, nothing, start_idx, batch_size, max_seq_len; policy_condition_mode=:state_only, state_target_mode=state_target_mode)
+        loss, output = WavePDEChess.paired_token_prediction_loss(model, ps, st, inputs, targets, target_mask)
         logits = WavePDEChess.extract_proposer_logits(output)
-        predicted_tokens = argmax_tokens(logits)
+        
+        if decoding_mode == :legality_aware
+            predicted_tokens = legality_aware_decode(logits, source_states, state_target_mode)
+        else
+            predicted_tokens = argmax_tokens(logits)
+        end
 
         total_loss += Float64(loss) * length(targets)
         total_tokens += length(targets)
@@ -386,9 +462,9 @@ function evaluate_state_transition_batches(model, ps, st, states, next_states; b
     )
 end
 
-function evaluate_state_transition_corpus(model, ps, st, corpus; batch_size::Int=8, policy_condition_mode::Symbol=:state_only)
+function evaluate_state_transition_corpus(model, ps, st, corpus; batch_size::Int=8, policy_condition_mode::Symbol=:state_only, decoding_mode::Symbol=:unconstrained)
     state_target_mode = :full
-    return evaluate_state_transition_corpus(model, ps, st, corpus; batch_size=batch_size, policy_condition_mode=policy_condition_mode, state_target_mode=state_target_mode)
+    return evaluate_state_transition_corpus(model, ps, st, corpus; batch_size=batch_size, policy_condition_mode=policy_condition_mode, state_target_mode=state_target_mode, decoding_mode=decoding_mode)
 end
 
 function evaluate_state_transition_corpus(
@@ -399,6 +475,7 @@ function evaluate_state_transition_corpus(
     batch_size::Int=8,
     policy_condition_mode::Symbol=:state_only,
     state_target_mode::Symbol=:full,
+    decoding_mode::Symbol=:unconstrained,
 )
     state_target_mode = WavePDEChess.validate_state_target_mode(state_target_mode)
     state_eval_len = WavePDEChess.state_target_length(first(corpus.active_next_states), state_target_mode)
@@ -413,12 +490,15 @@ function evaluate_state_transition_corpus(
     predicted_state_cols = Matrix{Int32}(undef, state_eval_len, 0)
     predicted_fact_cols = Matrix{Float32}(undef, length(WavePDEChess.CHESS_BOARD_TARGET_NAMES), 0)
     target_fact_cols = Matrix{Float32}(undef, length(WavePDEChess.CHESS_BOARD_TARGET_NAMES), 0)
+    predicted_probe_cols = Matrix{Float32}(undef, 0, 0)
+    target_probe_cols = Matrix{Float32}(undef, 0, 0)
 
     for file_path in corpus.files
         reload_file!(corpus, file_path)
         file_states = corpus.active_states
         file_next_states = corpus.active_next_states
         file_moves = corpus.active_moves
+        file_probe_targets = corpus.active_probe_targets
         file_max_seq_len = if policy_condition_mode == :state_action
             WavePDEChess.BOARD_STATE_SEQUENCE_LENGTH + 1 + WavePDEChess.MAX_POLICY_ACTION_TOKENS
         else
@@ -438,7 +518,14 @@ function evaluate_state_transition_corpus(
             )
             loss, output = WavePDEChess.paired_token_prediction_loss(model, ps, st, inputs, targets, target_mask)
             logits = WavePDEChess.extract_proposer_logits(output)
-            predicted_tokens = argmax_tokens(logits)
+            checker_scores = WavePDEChess.extract_checker_scores(output)
+            
+            if decoding_mode == :legality_aware
+                predicted_tokens = legality_aware_decode(logits, source_states, state_target_mode)
+            else
+                predicted_tokens = argmax_tokens(logits)
+            end
+            
             predicted_state_tokens = predicted_tokens[1:state_eval_len, :]
             target_state_tokens = targets[1:state_eval_len, :]
             masked_correct = count(((predicted_tokens .== targets) .& target_mask))
@@ -459,17 +546,37 @@ function evaluate_state_transition_corpus(
 
             predicted_fact_cols = hcat(predicted_fact_cols, state_fact_matrix(predicted_state_tokens))
             target_fact_cols = hcat(target_fact_cols, state_fact_matrix(target_state_tokens))
+            if checker_scores !== nothing && file_probe_targets !== nothing
+                batch_subset = start_idx:min(start_idx + batch_size - 1, length(file_probe_targets))
+                batch_probe_targets = hcat(file_probe_targets[batch_subset]...)
+                if size(predicted_probe_cols, 1) == 0
+                    predicted_probe_cols = Float32.(checker_scores)
+                    target_probe_cols = Float32.(batch_probe_targets)
+                else
+                    predicted_probe_cols = hcat(predicted_probe_cols, Float32.(checker_scores))
+                    target_probe_cols = hcat(target_probe_cols, Float32.(batch_probe_targets))
+                end
+            end
         end
     end
 
     fact_metrics = WavePDEChess.board_fact_metrics(predicted_fact_cols, target_fact_cols)
     slot_family_metrics = WavePDEChess.state_slot_family_metrics(predicted_state_cols, target_state_cols)
     legality_metrics = successor_legality_metrics(source_state_cols, predicted_state_cols)
+    probe_metrics = if size(predicted_probe_cols, 1) > 0 && size(target_probe_cols, 1) > 0
+        WavePDEChess.board_probe_metrics(
+            WavePDEChess.split_board_probe_targets(predicted_probe_cols),
+            WavePDEChess.split_board_probe_targets(target_probe_cols),
+        )
+    else
+        nothing
+    end
     return (
         token_loss=total_loss / total_tokens,
         exact_slot_accuracy=total_correct_tokens / total_tokens_seen,
         exact_sequence_match_rate=total_exact_matches / total_examples,
         board_fact_metrics=fact_metrics,
+        probe_metrics=probe_metrics,
         state_slot_family_metrics=slot_family_metrics,
         successor_legality_metrics=legality_metrics,
         num_examples=total_examples,
@@ -483,6 +590,7 @@ function evaluate_state_transition_checkpoint(
     batch_size::Int=8,
     policy_condition_mode::Symbol=:state_only,
     state_target_mode::Symbol=:full,
+    decoding_mode::Symbol=:unconstrained,
 )
     checkpoint = load_state_transition_checkpoint(checkpoint_path)
     corpus = WavePDEChess.StateTransitionParquetCorpus(data_dir; min_tokens=WavePDEChess.BOARD_STATE_SEQUENCE_LENGTH)
@@ -494,6 +602,7 @@ function evaluate_state_transition_checkpoint(
         batch_size=batch_size,
         policy_condition_mode=policy_condition_mode,
         state_target_mode=state_target_mode,
+        decoding_mode=decoding_mode,
     )
     return merge(
         (

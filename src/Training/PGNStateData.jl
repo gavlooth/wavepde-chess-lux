@@ -24,6 +24,16 @@ const BOARD_STATE_COUNT_BUCKETS = 16
 const BOARD_STATE_VOCAB_SIZE = 58
 const BOARD_STATE_COARSE_LENGTH = 72
 const BOARD_STATE_SEQUENCE_LENGTH = 210
+const BOARD_PROBE_FIELD_ORDER = (
+    (:attacked_white, 64),
+    (:attacked_black, 64),
+    (:in_check, 2),
+    (:pinned_count, 2),
+    (:king_pressure, 2),
+    (:mobility, 2),
+    (:attacked_piece_count, 2),
+)
+const BOARD_PROBE_TARGET_LENGTH = 138
 
 const BOARD_STATE_PIECE_SYMBOL_TOKENS = Dict(
     "." => BOARD_STATE_EMPTY_TOKEN,
@@ -214,6 +224,46 @@ function board_probe_targets_from_payload(payload)
             Float32(payload["black_attacked_piece_count"]),
         ],
     )
+end
+
+function flatten_board_probe_targets(targets::NamedTuple)
+    flat = Vector{Float32}(undef, BOARD_PROBE_TARGET_LENGTH)
+    offset = 1
+    for (field, width) in BOARD_PROBE_FIELD_ORDER
+        values = getfield(targets, field)
+        length(values) == width || throw(ArgumentError(
+            "Board probe field $(field) expected length $(width), got $(length(values)).",
+        ))
+        flat[offset:(offset + width - 1)] .= Float32.(values)
+        offset += width
+    end
+    return flat
+end
+
+function split_board_probe_targets(values::AbstractVector{<:Real})
+    length(values) == BOARD_PROBE_TARGET_LENGTH || throw(ArgumentError(
+        "Expected $(BOARD_PROBE_TARGET_LENGTH) board probe values, got $(length(values)).",
+    ))
+    offset = 1
+    parts = Pair{Symbol, Vector{Float32}}[]
+    for (field, width) in BOARD_PROBE_FIELD_ORDER
+        push!(parts, field => Float32.(collect(values[offset:(offset + width - 1)])))
+        offset += width
+    end
+    return (; parts...)
+end
+
+function split_board_probe_targets(values::AbstractMatrix{<:Real})
+    size(values, 1) == BOARD_PROBE_TARGET_LENGTH || throw(ArgumentError(
+        "Expected board probe matrix with $(BOARD_PROBE_TARGET_LENGTH) rows, got $(size(values, 1)).",
+    ))
+    offset = 1
+    parts = Pair{Symbol, Matrix{Float32}}[]
+    for (field, width) in BOARD_PROBE_FIELD_ORDER
+        push!(parts, field => Float32.(values[offset:(offset + width - 1), :]))
+        offset += width
+    end
+    return (; parts...)
 end
 
 function board_probe_targets_from_transcript(transcript::AbstractString)

@@ -12,6 +12,7 @@ Base.@kwdef struct TrainingConfig
     min_tokens::Int = 8
     train_file_update_interval::Int = 10
     checker_loss_weight::Float32 = 1.0f0
+    probe_loss_weight::Float32 = 0.0f0
     transition_loss_weight::Float32 = 0.0f0
     transition_candidates_per_example::Int = 1
     training_policy::Symbol = :full
@@ -42,6 +43,8 @@ mutable struct StateTransitionParquetCorpus
     active_states::Vector{Vector{Int32}}
     active_next_states::Vector{Vector{Int32}}
     active_moves::Union{Nothing, Vector{String}}
+    active_probe_targets::Union{Nothing, Vector{Vector{Float32}}}
+    probe_target_dim::Int
     min_tokens::Int
 end
 
@@ -58,6 +61,28 @@ const POLICY_CONDITION_MODES = (:state_only, :state_action)
 const STATE_TARGET_MODES = (:full, :coarse_only)
 const TRANSCRIPT_COLUMN_CANDIDATES = ("transcript",)
 const MOVE_COLUMN_CANDIDATES = ("move_san",)
+
+function find_board_probe_columns(columns::AbstractVector{<:AbstractString})
+    selected = Pair{Symbol, String}[]
+    missing = String[]
+    found_count = 0
+
+    for (field, _) in BOARD_PROBE_FIELD_ORDER
+        column_name = String(field)
+        if column_name in columns
+            push!(selected, field => column_name)
+            found_count += 1
+        else
+            push!(missing, column_name)
+        end
+    end
+
+    found_count == 0 && return nothing
+    isempty(missing) || throw(ArgumentError(
+        "State-transition parquet is missing board probe columns: $(join(missing, ", ")).",
+    ))
+    return (; selected...)
+end
 
 function discover_parquet_files(data_dir::AbstractString)
     files = String[]
@@ -304,12 +329,18 @@ function load_state_transition_examples(conn, path::AbstractString; min_tokens::
     state_column = find_state_tokens_column(columns)
     next_state_column = find_next_state_tokens_column(columns)
     move_column = find_move_column(columns)
+    probe_columns = find_board_probe_columns(columns)
 
     state_column === nothing && throw(ArgumentError("State-transition parquet $(path) must include a state_tokens column."))
     next_state_column === nothing && throw(ArgumentError("State-transition parquet $(path) must include a next_state_tokens column."))
 
     select_columns = ["$(state_column) AS state_tokens", "$(next_state_column) AS next_state_tokens"]
     move_column === nothing || push!(select_columns, "$(move_column) AS move_san")
+    if probe_columns !== nothing
+        for (field, column_name) in pairs(probe_columns)
+            push!(select_columns, "$(column_name) AS $(field)")
+        end
+    end
     rows = DBInterface.execute(
         conn,
         "SELECT $(join(select_columns, ", ")) FROM read_parquet('$(sql_escape(path))')",
@@ -317,6 +348,8 @@ function load_state_transition_examples(conn, path::AbstractString; min_tokens::
     states = Vector{Vector{Int32}}()
     next_states = Vector{Vector{Int32}}()
     moves = move_column === nothing ? nothing : String[]
+    probe_targets = probe_columns === nothing ? nothing : Vector{Vector{Float32}}()
+    probe_target_dim = probe_columns === nothing ? 0 : BOARD_PROBE_TARGET_LENGTH
     for row in rows
         state_tokens = parse_int_sequence(row[1])
         next_state_tokens = parse_int_sequence(row[2])
@@ -332,10 +365,26 @@ function load_state_transition_examples(conn, path::AbstractString; min_tokens::
             move_text = move_san === missing ? "" : String(move_san)
             push!(moves, move_text)
         end
+        if probe_targets !== nothing
+            probe_offset = move_column === nothing ? 2 : 3
+            probe_parts = Pair{Symbol, Vector{Float32}}[]
+            for (probe_index, (field, width)) in enumerate(BOARD_PROBE_FIELD_ORDER)
+                values = row[probe_offset + probe_index]
+                values === missing && throw(ArgumentError(
+                    "Board probe column $(field) is missing for a state-transition row in $(path).",
+                ))
+                parsed = parse_float_sequence(values)
+                length(parsed) == width || throw(ArgumentError(
+                    "Board probe field $(field) in $(path) expected length $(width), got $(length(parsed)).",
+                ))
+                push!(probe_parts, field => parsed)
+            end
+            push!(probe_targets, flatten_board_probe_targets((; probe_parts...)))
+        end
     end
 
     isempty(states) && throw(ArgumentError("No usable state-transition examples found in $(path)."))
-    return states, next_states, moves
+    return states, next_states, moves, probe_targets, probe_target_dim
 end
 
 function ChessParquetCorpus(data_dir::AbstractString; min_tokens::Int=8, board_target_mode::Symbol=:none)
@@ -374,7 +423,7 @@ function StateTransitionParquetCorpus(data_dir::AbstractString; min_tokens::Int=
     db = DuckDB.DB()
     conn = DBInterface.connect(db)
     active_file = first(files)
-    active_states, active_next_states, active_moves = load_state_transition_examples(
+    active_states, active_next_states, active_moves, active_probe_targets, probe_target_dim = load_state_transition_examples(
         conn,
         active_file;
         min_tokens=min_tokens,
@@ -388,6 +437,8 @@ function StateTransitionParquetCorpus(data_dir::AbstractString; min_tokens::Int=
         active_states,
         active_next_states,
         active_moves,
+        active_probe_targets,
+        probe_target_dim,
         min_tokens,
     )
 end
@@ -406,7 +457,7 @@ end
 
 function reload_file!(corpus::StateTransitionParquetCorpus, path::AbstractString)
     corpus.active_file = path
-    corpus.active_states, corpus.active_next_states, corpus.active_moves = load_state_transition_examples(
+    corpus.active_states, corpus.active_next_states, corpus.active_moves, corpus.active_probe_targets, corpus.probe_target_dim = load_state_transition_examples(
         corpus.conn,
         path;
         min_tokens=corpus.min_tokens,
@@ -517,6 +568,7 @@ function sample_training_batch(
     sampled_states = Vector{Vector{Int32}}(undef, batch_size)
     sampled_next_states = Vector{Vector{Int32}}(undef, batch_size)
     sampled_moves = policy_condition_mode == :state_action ? Vector{String}(undef, batch_size) : String[]
+    sampled_probe_targets = corpus.active_probe_targets === nothing ? nothing : Vector{Vector{Float32}}(undef, batch_size)
     max_batch_len = 0
 
     for i in 1:batch_size
@@ -525,6 +577,7 @@ function sample_training_batch(
         next_state_tokens = corpus.active_next_states[idx]
         sampled_states[i] = state_tokens
         sampled_next_states[i] = next_state_tokens
+        sampled_probe_targets === nothing || (sampled_probe_targets[i] = corpus.active_probe_targets[idx])
         if policy_condition_mode == :state_action
             corpus.active_moves === nothing && throw(ArgumentError(
                 "policy_condition_mode=:state_action requires parquet rows with move_san values.",
@@ -547,6 +600,7 @@ function sample_training_batch(
     tokens = zeros(Int32, max_batch_len, batch_size)
     target_tokens = zeros(Int32, max_batch_len, batch_size)
     target_mask = falses(max_batch_len, batch_size)
+    checker_targets = nothing
     for i in 1:batch_size
         if policy_condition_mode == :state_action
             conditioned_tokens = append_policy_action_tokens(sampled_states[i], sampled_moves[i])
@@ -563,10 +617,22 @@ function sample_training_batch(
         end
     end
 
+    if sampled_probe_targets !== nothing
+        checker_targets = zeros(Float32, corpus.probe_target_dim, batch_size)
+        for i in 1:batch_size
+            target = sampled_probe_targets[i]
+            length(target) == corpus.probe_target_dim || throw(ArgumentError(
+                "Board probe target length mismatch in sampled batch: expected $(corpus.probe_target_dim), got $(length(target)).",
+            ))
+            checker_targets[:, i] .= target
+        end
+    end
+
     return (
         tokens=tokens,
         target_tokens=target_tokens,
         target_mask=target_mask,
+        checker_targets=checker_targets,
     )
 end
 
@@ -758,14 +824,9 @@ function checker_regression_loss(predictions::AbstractArray{T, 2}, targets::Abst
     size(predictions) == size(targets) || throw(ArgumentError(
         "Checker prediction and target shapes differ: got $(size(predictions)) vs $(size(targets)).",
     ))
-
-    total = zero(T)
     count = length(predictions)
-    for i in eachindex(predictions, targets)
-        diff = predictions[i] - T(targets[i])
-        total += diff * diff
-    end
-    return total / T(count)
+    diff = predictions .- T.(targets)
+    return sum(abs2, diff) / T(count)
 end
 
 function autoregressive_loss(model::ChessModel, ps, st, batch; checker_loss_weight::Real=1.0, transition_loss_weight::Real=0.0)
@@ -860,6 +921,7 @@ function train!(model, corpus, cfg::TrainingConfig)
     optimizer = Optimisers.Adam(cfg.learning_rate)
     opt_state = Optimisers.setup(optimizer, ps)
     losses = Float32[]
+    checker_weight = cfg.probe_loss_weight > 0 ? cfg.probe_loss_weight : cfg.checker_loss_weight
 
     for step in 1:cfg.max_iters
         maybe_rotate_file!(corpus, rng, step; every=cfg.train_file_update_interval)
@@ -877,7 +939,7 @@ function train!(model, corpus, cfg::TrainingConfig)
             ps,
             st,
             batch;
-            checker_loss_weight=cfg.checker_loss_weight,
+            checker_loss_weight=checker_weight,
             transition_loss_weight=cfg.transition_loss_weight,
         )
         grads = Zygote.gradient(
@@ -886,7 +948,7 @@ function train!(model, corpus, cfg::TrainingConfig)
                 p,
                 st,
                 batch;
-                checker_loss_weight=cfg.checker_loss_weight,
+                checker_loss_weight=checker_weight,
                 transition_loss_weight=cfg.transition_loss_weight,
             ),
             ps,

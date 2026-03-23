@@ -19,6 +19,7 @@ function run_eval_chess_state_transition()
     batch_size = env_int("WAVEPDE_BATCH_SIZE", 8)
     policy_condition_mode = env_symbol("WAVEPDE_POLICY_CONDITION_MODE", :state_only)
     state_target_mode = env_symbol("WAVEPDE_STATE_TARGET_MODE", :full)
+    decoding_mode = env_symbol("WAVEPDE_DECODING_MODE", :unconstrained)
 
     result = evaluate_state_transition_checkpoint(
         checkpoint_path,
@@ -26,6 +27,7 @@ function run_eval_chess_state_transition()
         batch_size=batch_size,
         policy_condition_mode=policy_condition_mode,
         state_target_mode=state_target_mode,
+        decoding_mode=decoding_mode,
     )
 
     println("entrypoint=eval_chess_state_transition")
@@ -33,6 +35,7 @@ function run_eval_chess_state_transition()
     println("data_dir=$(result.data_dir)")
     println("policy_condition_mode=$(policy_condition_mode)")
     println("state_target_mode=$(state_target_mode)")
+    println("decoding_mode=$(decoding_mode)")
     println("num_examples=$(result.num_examples)")
     println("num_tokens=$(result.num_tokens)")
     println("token_loss=$(result.token_loss)")
@@ -45,6 +48,15 @@ function run_eval_chess_state_transition()
     println("board_fact_predicted_positive_rate=$(result.board_fact_metrics.predicted_positive_rate)")
     println("board_fact_target_positive_rate=$(result.board_fact_metrics.target_positive_rate)")
     println("board_fact_per_target_accuracy=$(result.board_fact_metrics.per_target_accuracy)")
+    if result.probe_metrics !== nothing
+        println("probe_attacked_white_accuracy=$(result.probe_metrics.attacked_white.overall_accuracy)")
+        println("probe_attacked_black_accuracy=$(result.probe_metrics.attacked_black.overall_accuracy)")
+        println("probe_in_check_accuracy=$(result.probe_metrics.in_check.overall_accuracy)")
+        println("probe_pinned_count_mse=$(result.probe_metrics.pinned_count.mse)")
+        println("probe_king_pressure_mae=$(result.probe_metrics.king_pressure.mae)")
+        println("probe_mobility_rmse=$(result.probe_metrics.mobility.rmse)")
+        println("probe_attacked_piece_count_max_abs_error=$(result.probe_metrics.attacked_piece_count.max_abs_error)")
+    end
     println("state_slot_coarse_token_accuracy=$(result.state_slot_family_metrics.coarse_state.token_accuracy)")
     println("state_slot_attack_token_accuracy=$(result.state_slot_family_metrics.attack_maps.token_accuracy)")
     println("state_slot_pressure_token_accuracy=$(result.state_slot_family_metrics.pressure_counts.token_accuracy)")

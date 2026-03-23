@@ -30,13 +30,25 @@ end
 function transcript_state_examples(transcript::AbstractString)
     moves = san_moves_from_transcript(transcript)
     raw_examples = pycall(py"wavepde_transcript_state_examples", PyAny, moves)
-    return [(
-        state_tokens=board_state_tokens(raw["state"]),
-        next_state_tokens=board_state_tokens(raw["next_state"]),
-        move_san=String(raw["move_san"]),
-        ply=Int(raw["ply"]),
-        transcript=String(raw["transcript"]),
-    ) for raw in raw_examples]
+    examples = NamedTuple[]
+    for raw in raw_examples
+        probe_targets = board_probe_targets_from_payload(raw["state"])
+        push!(examples, (
+            state_tokens=board_state_tokens(raw["state"]),
+            next_state_tokens=board_state_tokens(raw["next_state"]),
+            move_san=String(raw["move_san"]),
+            ply=Int(raw["ply"]),
+            transcript=String(raw["transcript"]),
+            attacked_white=probe_targets.attacked_white,
+            attacked_black=probe_targets.attacked_black,
+            in_check=probe_targets.in_check,
+            pinned_count=probe_targets.pinned_count,
+            king_pressure=probe_targets.king_pressure,
+            mobility=probe_targets.mobility,
+            attacked_piece_count=probe_targets.attacked_piece_count,
+        ))
+    end
+    return examples
 end
 
 function parse_transcript_parquet_state_examples(source::AbstractString)
@@ -87,7 +99,14 @@ function write_transcript_state_parquet(
             next_state_tokens INTEGER[],
             move_san VARCHAR,
             ply INTEGER,
-            transcript VARCHAR
+            transcript VARCHAR,
+            attacked_white INTEGER[],
+            attacked_black INTEGER[],
+            in_check INTEGER[],
+            pinned_count INTEGER[],
+            king_pressure INTEGER[],
+            mobility INTEGER[],
+            attacked_piece_count INTEGER[]
         )
     """)
 
@@ -98,7 +117,7 @@ function write_transcript_state_parquet(
         for example in batch
             push!(
                 values,
-                "($(state_sql_list(example.state_tokens)), $(state_sql_list(example.next_state_tokens)), '$(state_sql_escape(example.move_san))', $(example.ply), '$(state_sql_escape(example.transcript))')",
+                "($(state_sql_list(example.state_tokens)), $(state_sql_list(example.next_state_tokens)), '$(state_sql_escape(example.move_san))', $(example.ply), '$(state_sql_escape(example.transcript))', $(state_sql_list(example.attacked_white)), $(state_sql_list(example.attacked_black)), $(state_sql_list(example.in_check)), $(state_sql_list(example.pinned_count)), $(state_sql_list(example.king_pressure)), $(state_sql_list(example.mobility)), $(state_sql_list(example.attacked_piece_count)))",
             )
         end
         DBInterface.execute(conn, "INSERT INTO state_transitions VALUES " * join(values, ", "))
