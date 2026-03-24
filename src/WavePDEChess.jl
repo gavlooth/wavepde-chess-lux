@@ -176,6 +176,7 @@ Base.@kwdef struct WavePDEConfig
     norm_eps::Float32 = 1f-5
     cfl_safety_factor::Float32 = 0.95f0
     cfl_eps::Float32 = 1f-6
+    cfl_smoothness::Float32 = 1000f0
     pad_token::Int = 0
 end
 
@@ -193,6 +194,7 @@ function ChessModelConfig(config::WavePDEConfig)
         norm_eps=config.norm_eps,
         cfl_safety_factor=config.cfl_safety_factor,
         cfl_eps=config.cfl_eps,
+        cfl_smoothness=config.cfl_smoothness,
     )
     proposer = ChessMoveHeadConfig(
         vocab_size=config.vocab_size,
@@ -215,6 +217,7 @@ function chess_mamba_11m_config(
     dt_init::Float32=0.05f0,
     cfl_safety_factor::Float32=0.95f0,
     cfl_eps::Float32=1f-6,
+    cfl_smoothness::Float32=1000f0,
 )
     return ChessModelConfig(
         adapter=ChessAdapterConfig(vocab_size=vocab_size, d_model=288, pad_token=0),
@@ -226,6 +229,7 @@ function chess_mamba_11m_config(
             norm_eps=1f-5,
             cfl_safety_factor=cfl_safety_factor,
             cfl_eps=cfl_eps,
+            cfl_smoothness=cfl_smoothness,
         ),
         proposer=ChessMoveHeadConfig(vocab_size=vocab_size, d_model=288, tie_embeddings=true, bias=false),
         max_seq_len=1536,

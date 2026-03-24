@@ -42,6 +42,7 @@ Base.@kwdef struct BoardValueTrainingConfig
     min_tokens::Int = BOARD_STATE_SEQUENCE_LENGTH
     train_file_update_interval::Int = 10
     training_policy::Symbol = :full
+    cfl_penalty_weight::Float32 = 0.0f0
     cp_scale::Float32 = 400f0
     chunk_rows::Int = 20_000
     checkpoint_path::String = joinpath(pwd(), "checkpoints", "wavepde_chess_value_checkpoint.jls")
@@ -176,11 +177,11 @@ training_value_targets(batch::NamedTuple) = get(batch, :value_targets, nothing)
 function board_value_loss(model::BoardValueModel, ps, st, batch)
     targets = training_value_targets(batch)
     targets === nothing && throw(ArgumentError("Board value training batch must include value_targets."))
-    predictions, _ = Lux.apply(model, batch.tokens, ps, st)
+    predictions, new_state = Lux.apply(model, batch.tokens, ps, st)
     size(predictions) == size(targets) || throw(ArgumentError(
         "Board value prediction and target shapes differ: got $(size(predictions)) vs $(size(targets)).",
     ))
-    return checker_regression_loss(predictions, targets)
+    return checker_regression_loss(predictions, targets), _core_cfl_penalty_from_state(new_state)
 end
 
 function train_value!(model::BoardValueModel, corpus::BoardValueParquetCorpus, cfg::BoardValueTrainingConfig)
@@ -206,8 +207,15 @@ function train_value!(model::BoardValueModel, corpus::BoardValueParquetCorpus, c
             device,
         )
 
-        loss = board_value_loss(model, ps, st, batch)
-        grads = Zygote.gradient(p -> board_value_loss(model, p, st, batch), ps)[1]
+        loss, cfl_penalty = board_value_loss(model, ps, st, batch)
+        loss += Float32(cfg.cfl_penalty_weight) * cfl_penalty
+        grads = Zygote.gradient(
+            p -> begin
+                value_loss, cfl = board_value_loss(model, p, st, batch)
+                Float32(value_loss) + Float32(cfg.cfl_penalty_weight) * Float32(cfl)
+            end,
+            ps,
+        )[1]
         grads = apply_training_policy(model, grads, training_policy)
         opt_state, ps = Optimisers.update(opt_state, ps, grads)
 

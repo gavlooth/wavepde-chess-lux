@@ -24,6 +24,7 @@ function run_chess_lm_training()
         vocab_size=env_int("WAVEPDE_VOCAB_SIZE", 28),
         solver_steps=env_int("WAVEPDE_SOLVER_STEPS", 4),
         dt_init=env_float32("WAVEPDE_DT_INIT", 0.05f0),
+        cfl_smoothness=env_float32("WAVEPDE_CFL_SMOOTHNESS", 1000f0),
     )
 
     train_config = TrainingConfig(
@@ -34,6 +35,7 @@ function run_chess_lm_training()
         log_interval=env_int("WAVEPDE_LOG_INTERVAL", 10),
         min_tokens=env_int("WAVEPDE_MIN_TOKENS", 8),
         train_file_update_interval=env_int("WAVEPDE_FILE_ROTATE", 10),
+        cfl_penalty_weight=env_float32("WAVEPDE_CFL_PENALTY_WEIGHT", 0.0f0),
         training_policy=env_symbol("WAVEPDE_TRAINING_POLICY", :full),
         checkpoint_path=get(
             ENV,

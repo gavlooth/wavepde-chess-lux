@@ -39,6 +39,9 @@ function run_symbolic_bridge_training()
             solver_steps=env_int("WAVEPDE_SOLVER_STEPS", 2),
             dt_init=env_float32("WAVEPDE_DT_INIT", 0.05f0),
             norm_eps=env_float32("WAVEPDE_NORM_EPS", 1f-5),
+            cfl_safety_factor=env_float32("WAVEPDE_CFL_SAFETY_FACTOR", 0.95f0),
+            cfl_eps=env_float32("WAVEPDE_CFL_EPS", 1f-6),
+            cfl_smoothness=env_float32("WAVEPDE_CFL_SMOOTHNESS", 1000f0),
         ),
         proposer=ChessMoveHeadConfig(
             vocab_size=env_int("WAVEPDE_VOCAB_SIZE", SYMBOLIC_VOCAB_SIZE),
@@ -57,6 +60,7 @@ function run_symbolic_bridge_training()
         log_interval=env_int("WAVEPDE_LOG_INTERVAL", 10),
         min_tokens=env_int("WAVEPDE_MIN_TOKENS", 8),
         train_file_update_interval=env_int("WAVEPDE_FILE_ROTATE", 10),
+        cfl_penalty_weight=env_float32("WAVEPDE_CFL_PENALTY_WEIGHT", 0.0f0),
         training_policy=env_symbol("WAVEPDE_TRAINING_POLICY", :full),
         checkpoint_path=get(
             ENV,

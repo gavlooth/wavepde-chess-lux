@@ -26,6 +26,7 @@ function build_state_transition_core_config(d_model::Int, max_seq_len::Int)
         norm_eps=env_float32("WAVEPDE_NORM_EPS", 1f-5),
         cfl_safety_factor=env_float32("WAVEPDE_CFL_SAFETY_FACTOR", 0.95f0),
         cfl_eps=env_float32("WAVEPDE_CFL_EPS", 1f-6),
+        cfl_smoothness=env_float32("WAVEPDE_CFL_SMOOTHNESS", 1000f0),
     )
 end
 
@@ -79,6 +80,7 @@ function run_chess_state_transition_training()
         train_file_update_interval=env_int("WAVEPDE_FILE_ROTATE", 10),
         training_policy=env_symbol("WAVEPDE_TRAINING_POLICY", :full),
         probe_loss_weight=probe_loss_weight,
+        cfl_penalty_weight=env_float32("WAVEPDE_CFL_PENALTY_WEIGHT", 0.0f0),
         policy_condition_mode=policy_condition_mode,
         state_target_mode=env_symbol("WAVEPDE_STATE_TARGET_MODE", :full),
         checkpoint_path=get(

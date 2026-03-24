@@ -48,6 +48,9 @@ function run_chess_dual_surface_training()
             solver_steps=env_int("WAVEPDE_SOLVER_STEPS", 4),
             dt_init=env_float32("WAVEPDE_DT_INIT", 0.05f0),
             norm_eps=env_float32("WAVEPDE_NORM_EPS", 1f-5),
+            cfl_safety_factor=env_float32("WAVEPDE_CFL_SAFETY_FACTOR", 0.95f0),
+            cfl_eps=env_float32("WAVEPDE_CFL_EPS", 1f-6),
+            cfl_smoothness=env_float32("WAVEPDE_CFL_SMOOTHNESS", 1000f0),
         ),
         state_head=ChessMoveHeadConfig(
             vocab_size=env_int("WAVEPDE_VOCAB_SIZE", BOARD_STATE_VOCAB_SIZE),
@@ -74,6 +77,7 @@ function run_chess_dual_surface_training()
         train_file_update_interval=env_int("WAVEPDE_FILE_ROTATE", 10),
         state_loss_weight=env_float32("WAVEPDE_STATE_LOSS_WEIGHT", 1.0f0),
         transcript_loss_weight=env_float32("WAVEPDE_TRANSCRIPT_LOSS_WEIGHT", 0.2f0),
+        cfl_penalty_weight=env_float32("WAVEPDE_CFL_PENALTY_WEIGHT", 0.0f0),
         training_policy=env_symbol("WAVEPDE_TRAINING_POLICY", :full),
         checkpoint_path=get(
             ENV,

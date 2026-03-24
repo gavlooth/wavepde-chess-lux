@@ -32,6 +32,9 @@ function run_chess_checker_training()
             solver_steps=env_int("WAVEPDE_SOLVER_STEPS", 4),
             dt_init=env_float32("WAVEPDE_DT_INIT", 0.05f0),
             norm_eps=env_float32("WAVEPDE_NORM_EPS", 1f-5),
+            cfl_safety_factor=env_float32("WAVEPDE_CFL_SAFETY_FACTOR", 0.95f0),
+            cfl_eps=env_float32("WAVEPDE_CFL_EPS", 1f-6),
+            cfl_smoothness=env_float32("WAVEPDE_CFL_SMOOTHNESS", 1000f0),
         ),
         proposer=ChessMoveHeadConfig(
             vocab_size=env_int("WAVEPDE_VOCAB_SIZE", 28),
@@ -56,6 +59,7 @@ function run_chess_checker_training()
         min_tokens=env_int("WAVEPDE_MIN_TOKENS", 8),
         train_file_update_interval=env_int("WAVEPDE_FILE_ROTATE", 10),
         checker_loss_weight=env_float32("WAVEPDE_CHECKER_LOSS_WEIGHT", 1.0f0),
+        cfl_penalty_weight=env_float32("WAVEPDE_CFL_PENALTY_WEIGHT", 0.0f0),
         transition_loss_weight=env_float32("WAVEPDE_TRANSITION_LOSS_WEIGHT", 0.0f0),
         transition_candidates_per_example=env_int("WAVEPDE_TRANSITION_CANDIDATES", 1),
         training_policy=env_symbol("WAVEPDE_TRAINING_POLICY", :full),

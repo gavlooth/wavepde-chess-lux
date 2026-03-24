@@ -1,5 +1,39 @@
 # SESSION REPORT
 
+## 2026-03-24
+
+- objectives attempted
+  - remove hard CFL timestep clipping and replace it with smooth CFL control in `WavePDECore`
+  - propagate a differentiable CFL-violation penalty into training objectives for sequence, checker, and value tasks
+  - expose new CFL tuning knobs through existing launch scripts
+- code/config changes made
+  - added `cfl_smoothness` and `cfl_penalty_weight` to `WavePDECoreConfig`
+  - changed `WavePDESpectralMixer` from hard clamp to soft scale
+    - returns `raw_cfl`, `raw_cfl_violation`, `cfl_penalty`, `cfl_scale` in mixer state for downstream loss use
+  - added `core_cfl_penalty(core_state::NamedTuple)` and integrated it in:
+    - `src/Training/Training.jl` (`TrainingConfig.cfl_penalty_weight`, `autoregressive_loss`, `train!`)
+    - `src/Training/ValueTraining.jl` (`BoardValueTrainingConfig.cfl_penalty_weight`, `board_value_loss`, `train_value!`)
+    - `src/Training/DualSurfaceTraining.jl` (`DualSurfaceTrainingConfig.cfl_penalty_weight`, `dual_surface_loss`, `train_dual_surface!`)
+  - updated launch scripts to accept/propagate `WAVEPDE_CFL_SMOOTHNESS` and `WAVEPDE_CFL_PENALTY_WEIGHT`:
+    - `scripts/train_chess_checker.jl`
+    - `scripts/train_chess_state_transition.jl`
+    - `scripts/train_chess_value.jl`
+    - `scripts/train_chess_dual_surface.jl`
+    - `scripts/train_chess_lm.jl`
+    - `scripts/train_symbolic_bridge.jl`
+  - updated `WavePDEConfig` and `chess_mamba_11m_config` to carry `cfl_smoothness`
+- experiment commands and key metrics
+  - validation command run: `julia --project=. -e 'include("src/WavePDEChess.jl"); println("loaded")'`
+  - sanity checks:
+    - default config instantiation works with `cfl_penalty_weight=0.0`
+    - `WavePDECoreConfig()` reports `cfl_smoothness=1000.0`
+    - `chess_mamba_11m_config()` carries `cfl_smoothness=1000.0`
+- unresolved issues and next actions
+  - no live training run was executed in this session after the penalty wiring
+  - next action: run a short smoke run with `WAVEPDE_CFL_PENALTY_WEIGHT` non-zero to verify stability/no-divergence on state-transition and value loops
+
+Signature: Codex (GPT-5)
+
 ## 2026-03-23
 
 - objectives attempted

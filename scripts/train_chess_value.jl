@@ -38,6 +38,7 @@ function run_chess_value_training()
             norm_eps=env_float32("WAVEPDE_NORM_EPS", 1f-5),
             cfl_safety_factor=env_float32("WAVEPDE_CFL_SAFETY_FACTOR", 0.95f0),
             cfl_eps=env_float32("WAVEPDE_CFL_EPS", 1f-6),
+            cfl_smoothness=env_float32("WAVEPDE_CFL_SMOOTHNESS", 1000f0),
         ),
         value_head=ChessCheckerHeadConfig(
             d_model=d_model,
@@ -56,6 +57,7 @@ function run_chess_value_training()
         min_tokens=env_int("WAVEPDE_MIN_TOKENS", BOARD_STATE_SEQUENCE_LENGTH),
         train_file_update_interval=env_int("WAVEPDE_FILE_ROTATE", 10),
         training_policy=env_symbol("WAVEPDE_TRAINING_POLICY", :full),
+        cfl_penalty_weight=env_float32("WAVEPDE_CFL_PENALTY_WEIGHT", 0.0f0),
         cp_scale=cp_scale,
         chunk_rows=env_int("WAVEPDE_CHUNK_ROWS", 20_000),
         checkpoint_path=get(

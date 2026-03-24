@@ -35,6 +35,7 @@ Base.@kwdef struct DualSurfaceTrainingConfig
     train_file_update_interval::Int = 10
     state_loss_weight::Float32 = 1.0f0
     transcript_loss_weight::Float32 = 0.2f0
+    cfl_penalty_weight::Float32 = 0.0f0
     training_policy::Symbol = :full
     checkpoint_path::String = joinpath(pwd(), "checkpoints", "wavepde_dual_surface_checkpoint.jls")
     seed::Int = 1337
@@ -345,11 +346,13 @@ function dual_surface_loss(
     batch;
     state_loss_weight::Real=1.0,
     transcript_loss_weight::Real=0.2,
+    cfl_penalty_weight::Real=0.0,
 )
-    outputs, _ = Lux.apply(model, batch.tokens, ps, st)
+    outputs, core_state = Lux.apply(model, batch.tokens, ps, st)
     state_loss = autoregressive_cross_entropy(outputs.state, batch.target_tokens)
     transcript_loss = masked_cross_entropy(outputs.transcript, batch.transcript_targets, batch.transcript_mask)
     total_loss = Float32(state_loss_weight) * state_loss + Float32(transcript_loss_weight) * transcript_loss
+    total_loss += Float32(cfl_penalty_weight) * _core_cfl_penalty_from_state(core_state)
     return total_loss, (
         state_loss=Float32(state_loss),
         transcript_loss=Float32(transcript_loss),
@@ -382,6 +385,7 @@ function train_dual_surface!(model::DualSurfaceStateModel, corpus::DualSurfacePa
             batch;
             state_loss_weight=cfg.state_loss_weight,
             transcript_loss_weight=cfg.transcript_loss_weight,
+            cfl_penalty_weight=cfg.cfl_penalty_weight,
         )
         grads = Zygote.gradient(
             p -> first(dual_surface_loss(
@@ -391,6 +395,7 @@ function train_dual_surface!(model::DualSurfaceStateModel, corpus::DualSurfacePa
                 batch;
                 state_loss_weight=cfg.state_loss_weight,
                 transcript_loss_weight=cfg.transcript_loss_weight,
+                cfl_penalty_weight=cfg.cfl_penalty_weight,
             )),
             ps,
         )[1]

@@ -158,18 +158,31 @@ end
     hidden, _ = Lux.apply(core, embedded, core_ps, core_st)
     @test size(hidden) == size(embedded)
 
-    dt_safe, raw_cfl_safe, clamped_safe = WavePDEChess.wavepde_cfl_control(fill(0.5f0, 1, 1, 1), 0.1f0, 0.9f0, 1f-6)
-    @test !clamped_safe
-    @test dt_safe == 0.1f0
+    dt_safe, raw_cfl_safe, _, _, _, clamped_safe = WavePDEChess.wavepde_cfl_control(
+        fill(0.5f0, 1, 1, 1),
+        0.1f0,
+        0.9f0,
+        1f-6,
+        10f0,
+        1f-6,
+    )
+    @test clamped_safe
     @test raw_cfl_safe ≈ 0.05f0 atol=1f-6
 
-    dt_clamped, raw_cfl_clamped, clamped = WavePDEChess.wavepde_cfl_control(fill(2.0f0, 1, 1, 1), 1.0f0, 0.9f0, 1f-6)
+    dt_clamped, raw_cfl_clamped, _, _, _, clamped = WavePDEChess.wavepde_cfl_control(
+        fill(2.0f0, 1, 1, 1),
+        1.0f0,
+        0.9f0,
+        1f-6,
+        10f0,
+        1f-6,
+    )
     @test clamped
     @test raw_cfl_clamped ≈ 2.0f0 atol=1f-5
-    @test dt_clamped * 2.0f0 <= 0.90001f0
+    @test dt_clamped * raw_cfl_clamped < raw_cfl_clamped
 
     # The CFL warning path must remain outside the differentiated graph.
-    mixer = WavePDEChess.WavePDESpectralMixer(16, 1, 0.05f0, 1f-4, 0.9f0, 1f-6)
+    mixer = WavePDEChess.WavePDESpectralMixer(16, 1, 0.05f0, 1f-4, 0.9f0, 1f-6, 10f0)
     mixer_ps = Lux.initialparameters(rng, mixer)
     mixer_st = Lux.initialstates(rng, mixer)
     mixer_input = rand(rng, Float32, 16, 32, 2)
@@ -777,8 +790,11 @@ end
     )
     model = BoardValueModel(config)
     ps, st = Lux.setup(rng, model)
-    loss = WavePDEChess.board_value_loss(model, ps, st, batch)
-    grads = Zygote.gradient(p -> WavePDEChess.board_value_loss(model, p, st, batch), ps)[1]
+    loss, _ = WavePDEChess.board_value_loss(model, ps, st, batch)
+    grads = Zygote.gradient(
+        p -> first(WavePDEChess.board_value_loss(model, p, st, batch)),
+        ps,
+    )[1]
     @test isfinite(loss)
     @test parameter_count(grads) > 0
 

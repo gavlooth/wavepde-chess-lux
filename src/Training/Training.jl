@@ -12,6 +12,7 @@ Base.@kwdef struct TrainingConfig
     min_tokens::Int = 8
     train_file_update_interval::Int = 10
     checker_loss_weight::Float32 = 1.0f0
+    cfl_penalty_weight::Float32 = 0.0f0
     probe_loss_weight::Float32 = 0.0f0
     transition_loss_weight::Float32 = 0.0f0
     transition_candidates_per_example::Int = 1
@@ -783,9 +784,9 @@ function next_token_prediction_loss(model, ps, st, batch_tokens::AbstractMatrix{
     @assert size(batch_tokens, 1) >= 2 "Batch sequence length must be at least 2 for next-token prediction."
     inputs = batch_tokens[1:(end - 1), :]
     targets = batch_tokens[2:end, :]
-    output, _ = Lux.apply(model, inputs, ps, st)
+    output, new_state = Lux.apply(model, inputs, ps, st)
     logits = extract_proposer_logits(output)
-    return autoregressive_cross_entropy(logits, targets), output
+    return autoregressive_cross_entropy(logits, targets), output, _core_cfl_penalty_from_state(new_state)
 end
 
 function paired_token_prediction_loss(
@@ -799,7 +800,7 @@ function paired_token_prediction_loss(
     size(input_tokens) == size(target_tokens) || throw(ArgumentError(
         "Paired token prediction expects matching input and target shapes, got $(size(input_tokens)) vs $(size(target_tokens)).",
     ))
-    output, _ = Lux.apply(model, input_tokens, ps, st)
+    output, new_state = Lux.apply(model, input_tokens, ps, st)
     logits = extract_proposer_logits(output)
     size(logits, 2) == size(target_tokens, 1) || throw(ArgumentError(
         "Model output sequence length $(size(logits, 2)) does not match paired target length $(size(target_tokens, 1)).",
@@ -808,8 +809,16 @@ function paired_token_prediction_loss(
         "Model output batch size $(size(logits, 3)) does not match paired target batch size $(size(target_tokens, 2)).",
     ))
     loss = target_mask === nothing ? autoregressive_cross_entropy(logits, target_tokens) : masked_cross_entropy(logits, target_tokens, target_mask)
-    return loss, output
+    return loss, output, _core_cfl_penalty_from_state(new_state)
 end
+
+@inline function _core_cfl_penalty_from_state(state::NamedTuple)
+    core_state = get(state, :core, nothing)
+    core_state === nothing && return zero(Float32)
+    return core_cfl_penalty(core_state)
+end
+
+_core_cfl_penalty_from_state(::Any) = zero(Float32)
 
 function proposer_prediction_loss(model, ps, st, batch)
     target_tokens = training_target_tokens(batch)
@@ -829,9 +838,17 @@ function checker_regression_loss(predictions::AbstractArray{T, 2}, targets::Abst
     return sum(abs2, diff) / T(count)
 end
 
-function autoregressive_loss(model::ChessModel, ps, st, batch; checker_loss_weight::Real=1.0, transition_loss_weight::Real=0.0)
-    token_loss, _ = proposer_prediction_loss(model, ps, st, batch)
-    return token_loss
+function autoregressive_loss(
+    model::ChessModel,
+    ps,
+    st,
+    batch;
+    checker_loss_weight::Real=1.0,
+    transition_loss_weight::Real=0.0,
+    cfl_penalty_weight::Real=0.0,
+)
+    token_loss, _, cfl_penalty = proposer_prediction_loss(model, ps, st, batch)
+    return token_loss + Float32(cfl_penalty_weight) * cfl_penalty
 end
 
 function autoregressive_loss(
@@ -841,10 +858,10 @@ function autoregressive_loss(
     batch;
     checker_loss_weight::Real=1.0,
     transition_loss_weight::Real=0.0,
+    cfl_penalty_weight::Real=0.0,
 )
-    token_batch = training_tokens(batch)
-    token_loss, output = proposer_prediction_loss(model, ps, st, batch)
-    total_loss = token_loss
+    token_loss, output, token_cfl_penalty = proposer_prediction_loss(model, ps, st, batch)
+    total_loss = token_loss + Float32(cfl_penalty_weight) * token_cfl_penalty
 
     checker_targets = training_checker_targets(batch)
     if checker_targets !== nothing
@@ -857,11 +874,12 @@ function autoregressive_loss(
     transition_targets = training_transition_targets(batch)
     transition_tokens = training_transition_tokens(batch)
     if transition_loss_weight > 0 && transition_tokens !== nothing && transition_targets !== nothing
-        transition_outputs, _ = Lux.apply(model, transition_tokens, ps, st)
+        transition_outputs, transition_state = Lux.apply(model, transition_tokens, ps, st)
         transition_scores = extract_checker_scores(transition_outputs)
         transition_scores === nothing && throw(ArgumentError("Multi-head model output must include :checker scores when transition supervision is provided."))
         transition_loss = checker_regression_loss(transition_scores, transition_targets)
         total_loss += Float32(transition_loss_weight) * transition_loss
+        total_loss += Float32(cfl_penalty_weight) * Float32(transition_loss_weight) * _core_cfl_penalty_from_state(transition_state)
     end
 
     return total_loss
@@ -941,6 +959,7 @@ function train!(model, corpus, cfg::TrainingConfig)
             batch;
             checker_loss_weight=checker_weight,
             transition_loss_weight=cfg.transition_loss_weight,
+            cfl_penalty_weight=cfg.cfl_penalty_weight,
         )
         grads = Zygote.gradient(
             p -> autoregressive_loss(
@@ -950,6 +969,7 @@ function train!(model, corpus, cfg::TrainingConfig)
                 batch;
                 checker_loss_weight=checker_weight,
                 transition_loss_weight=cfg.transition_loss_weight,
+                cfl_penalty_weight=cfg.cfl_penalty_weight,
             ),
             ps,
         )[1]
